@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>レフェリーシグナル判定（カメラ）</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js" crossorigin="anonymous"></script>
+<style>
+  :root{
+    --bg:#081810;
+    --surface:rgba(18,52,32,0.86);
+    --surface-2:rgba(14,44,28,0.92);
+    --text:#F2F0E6;
+    --muted:#9FB7A6;
+    --accent:#D8B23A;
+    --accent-2:#5FA97C;
+    --line:rgba(200,214,204,0.22);
+    --red:#E2695C;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{
+    margin:0;padding:0;
+    width:100%;height:100%;
+    overflow:hidden;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Zen Kaku Gothic New', -apple-system, 'Hiragino Sans', sans-serif;
+  }
+  .display{ font-family:'Big Shoulders Display', sans-serif; font-weight:800; }
+
+  #app{
+    position:fixed;
+    inset:0;
+    display:flex;
+    flex-direction:column;
+  }
+
+  /* ---- viewfinder ---- */
+  #stage{
+    position:relative;
+    flex:1;
+    min-height:0;
+    background:#000;
+    overflow:hidden;
+  }
+  #view{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+  }
+  video#video{
+    position:fixed;
+    width:1px;height:1px;
+    opacity:0;
+    pointer-events:none;
+    top:0;left:0;
+  }
+
+  /* ---- start screen ---- */
+  #startScreen{
+    position:absolute;
+    inset:0;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:18px;
+    padding:32px;
+    text-align:center;
+    background:radial-gradient(circle at 50% 30%, #163d24 0%, #081810 75%);
+    z-index:20;
+  }
+  #startScreen h1{
+    font-size:clamp(1.6rem,7vw,2.2rem);
+    margin:0;
+    line-height:1.05;
+  }
+  #startScreen p{
+    max-width:34ch;
+    color:var(--muted);
+    font-size:0.92rem;
+    margin:0;
+  }
+  #startBtn{
+    font-family:'Big Shoulders Display', sans-serif;
+    font-weight:700;
+    font-size:1.2rem;
+    letter-spacing:0.02em;
+    padding:16px 40px;
+    border:2px solid var(--accent);
+    background:var(--accent);
+    color:#0B2818;
+    cursor:pointer;
+    margin-top:6px;
+  }
+  #startBtn:active{ opacity:0.85; }
+  .privacy-note{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:0.78rem;
+    color:var(--muted);
+    border:1px solid var(--line);
+    padding:10px 14px;
+    max-width:34ch;
+  }
+
+  /* ---- top status bar ---- */
+  #topBar{
+    position:absolute;
+    top:0;left:0;right:0;
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
+    background:linear-gradient(to bottom, rgba(0,0,0,0.55), transparent);
+    z-index:10;
+    pointer-events:none;
+  }
+  #liveBadge{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-size:0.72rem;
+    color:var(--muted);
+    background:rgba(0,0,0,0.4);
+    padding:5px 10px;
+    border:1px solid var(--line);
+  }
+  #liveDot{
+    width:7px;height:7px;border-radius:50%;
+    background:var(--muted);
+  }
+  #liveDot.on{ background:#5FE07C; box-shadow:0 0 6px #5FE07C; }
+  #confMini{
+    background:rgba(0,0,0,0.4);
+    border:1px solid var(--line);
+    font-size:0.7rem;
+    color:var(--muted);
+    padding:6px 10px;
+    max-width:52vw;
+    pointer-events:auto;
+  }
+  #confMini .row{ display:flex; justify-content:space-between; gap:10px; white-space:nowrap; }
+  #confMini .row + .row{ margin-top:2px; }
+  #confMini .row.top{ color:var(--accent); }
+
+  /* ---- foul banner ---- */
+  #foulBanner{
+    position:absolute;
+    left:50%;
+    top:14%;
+    transform:translate(-50%,-16px);
+    background:var(--surface-2);
+    border:1px solid var(--accent);
+    padding:14px 26px;
+    text-align:center;
+    z-index:15;
+    opacity:0;
+    pointer-events:none;
+    transition:opacity .25s ease, transform .25s ease;
+    max-width:88vw;
+  }
+  #foulBanner.show{
+    opacity:1;
+    transform:translate(-50%,0);
+  }
+  #foulBanner .tag{
+    font-size:0.68rem;
+    color:var(--accent);
+    letter-spacing:0.08em;
+  }
+  #foulBanner .name{
+    font-family:'Big Shoulders Display', sans-serif;
+    font-weight:800;
+    font-size:clamp(1.5rem,7vw,2.1rem);
+    line-height:1.05;
+    margin:2px 0;
+  }
+  #foulBanner .conf{
+    font-size:0.78rem;
+    color:var(--muted);
+  }
+
+  /* ---- bottom controls ---- */
+  #controls{
+    position:absolute;
+    left:0;right:0;bottom:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:14px;
+    padding:14px 14px calc(14px + env(safe-area-inset-bottom));
+    background:linear-gradient(to top, rgba(0,0,0,0.6), transparent);
+    z-index:10;
+  }
+  .ctrl-btn{
+    font-family:inherit;
+    font-size:0.82rem;
+    color:var(--text);
+    background:rgba(18,52,32,0.75);
+    border:1px solid var(--line);
+    padding:10px 16px;
+    display:flex;
+    align-items:center;
+    gap:6px;
+    cursor:pointer;
+  }
+  .ctrl-btn:active{ background:rgba(18,52,32,0.95); }
+  .ctrl-btn.stop{ border-color:var(--red); color:var(--red); }
+  .ctrl-btn.primary{ border-color:var(--accent); color:var(--accent); }
+
+  /* ---- log drawer ---- */
+  #logDrawer{
+    position:absolute;
+    left:0;right:0;bottom:0;
+    max-height:60%;
+    background:var(--surface-2);
+    border-top:1px solid var(--line);
+    transform:translateY(100%);
+    transition:transform .25s ease;
+    z-index:25;
+    display:flex;
+    flex-direction:column;
+  }
+  #logDrawer.open{ transform:translateY(0); }
+  #logDrawerHeader{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:14px 16px;
+    border-bottom:1px solid var(--line);
+  }
+  #logDrawerHeader h2{
+    font-family:'Big Shoulders Display', sans-serif;
+    font-size:1rem;
+    margin:0;
+  }
+  #logDrawerHeader button{
+    background:none;border:none;color:var(--muted);
+    font-size:0.8rem; cursor:pointer;
+  }
+  #logList{
+    list-style:none;
+    margin:0;
+    padding:6px 16px calc(16px + env(safe-area-inset-bottom));
+    overflow-y:auto;
+  }
+  #logList li{
+    display:flex;
+    justify-content:space-between;
+    gap:10px;
+    padding:9px 0;
+    border-bottom:1px solid var(--line);
+    font-size:0.88rem;
+  }
+  #logList li .lt{ color:var(--muted); font-size:0.76rem; font-variant-numeric:tabular-nums; }
+  #logEmpty{ color:var(--muted); font-size:0.84rem; padding:14px 0; }
+
+  /* ---- error / permission overlay ---- */
+  #errorOverlay{
+    position:absolute;
+    inset:0;
+    display:none;
+    align-items:center;
+    justify-content:center;
+    padding:28px;
+    background:rgba(8,24,16,0.96);
+    z-index:30;
+    text-align:center;
+  }
+  #errorOverlay.show{ display:flex; }
+  #errorOverlay .box{ max-width:40ch; }
+  #errorOverlay h2{ font-size:1.1rem; color:var(--red); margin:0 0 10px; }
+  #errorOverlay p{ font-size:0.86rem; color:var(--muted); line-height:1.7; white-space:pre-line; }
+  #errorOverlay button{
+    margin-top:16px;
+    font-family:inherit;
+    padding:10px 20px;
+    background:none;
+    border:1px solid var(--line);
+    color:var(--text);
+    cursor:pointer;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <video id="video" playsinline muted></video>
+
+    <div id="topBar">
+      <div id="liveBadge"><span id="liveDot"></span><span id="liveText">停止中</span></div>
+      <div id="confMini"></div>
+    </div>
+
+    <div id="foulBanner">
+      <div class="tag">検出</div>
+      <div class="name" id="foulName">—</div>
+      <div class="conf" id="foulConf"></div>
+    </div>
+
+    <div id="startScreen">
+      <h1 class="display">レフェリーシグナル判定<br>（カメラ版）</h1>
+      <p>カメラをレフェリーに向けると、反則のシグナルをリアルタイムで検出します。</p>
+      <button id="startBtn">カメラを開始</button>
+      <div class="privacy-note">🔒 映像は一切外部送信されません。骨格推定・判定はすべて端末内（ブラウザ内）で処理されます。</div>
+    </div>
+
+    <div id="controls" style="display:none;">
+      <button class="ctrl-btn" id="flipBtn">🔄 前後切替</button>
+      <button class="ctrl-btn stop" id="stopBtn">■ 停止</button>
+      <button class="ctrl-btn primary" id="logBtn">📋 履歴</button>
+    </div>
+
+    <div id="errorOverlay">
+      <div class="box">
+        <h2>エラー</h2>
+        <p id="errorText"></p>
+        <button id="errorCloseBtn">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="logDrawer">
+    <div id="logDrawerHeader">
+      <h2 class="display">検出履歴</h2>
+      <button id="logClearBtn">クリア</button>
+      <button id="logCloseBtn">閉じる ✕</button>
+    </div>
+    <ul id="logList"></ul>
+  </div>
+</div>
+
+<script>
+/* =========================================================================
+   POSE FEATURE EXTRACTION  (identical logic to the photo-based version)
+   MediaPipe Pose landmark indices (BlazePose, 33 points):
+   11 left shoulder / 12 right shoulder, 13 left elbow / 14 right elbow,
+   15 left wrist / 16 right wrist, 23 left hip / 24 right hip
+   ========================================================================= */
+const LM = { LS:11, RS:12, LE:13, RE:14, LW:15, RW:16, LH:23, RH:24 };
+
+function dist(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function elevationAngle(shoulder, elbow){
+  const dx = Math.abs(elbow.x - shoulder.x);
+  const dy = elbow.y - shoulder.y;
+  return Math.atan2(dx, -dy) * 180 / Math.PI;
+}
+
+function elbowBendAngle(shoulder, elbow, wrist){
+  const v1 = { x: shoulder.x - elbow.x, y: shoulder.y - elbow.y };
+  const v2 = { x: wrist.x - elbow.x,    y: wrist.y - elbow.y };
+  const dot = v1.x*v2.x + v1.y*v2.y;
+  const mag = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y);
+  if (mag === 0) return 180;
+  const cos = Math.min(1, Math.max(-1, dot / mag));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
+function extractFeatures(landmarks){
+  const ls = landmarks[LM.LS], rs = landmarks[LM.RS];
+  const le = landmarks[LM.LE], re = landmarks[LM.RE];
+  const lw = landmarks[LM.LW], rw = landmarks[LM.RW];
+  const lh = landmarks[LM.LH], rh = landmarks[LM.RH];
+
+  const shoulderMid = { x:(ls.x+rs.x)/2, y:(ls.y+rs.y)/2 };
+  const hipMid       = { x:(lh.x+rh.x)/2, y:(lh.y+rh.y)/2 };
+  const torsoLength  = Math.max(dist(shoulderMid, hipMid), 1e-4);
+
+  function armFeatures(shoulder, elbow, wrist, hip){
+    return {
+      elevation: elevationAngle(shoulder, elbow),
+      elbowBend: elbowBendAngle(shoulder, elbow, wrist),
+      wristHipDist: dist(wrist, hip) / torsoLength,
+      visibility: Math.min(shoulder.visibility ?? 1, elbow.visibility ?? 1, wrist.visibility ?? 1)
+    };
+  }
+
+  return {
+    left:  armFeatures(ls, le, lw, lh),
+    right: armFeatures(rs, re, rw, rh),
+    wristToWristDist: dist(lw, rw) / torsoLength,
+    torsoLength
+  };
+}
+
+/* =========================================================================
+   RULE-BASED CLASSIFIER (same tuned thresholds as the photo-based app)
+   ========================================================================= */
+const CONFIG = {
+  overhead:   { elevation:[0,5,35,60],    elbow:[125,150,180,181] },
+  horizontal: { elevation:[55,75,105,125],elbow:[90,110,155,178] },
+  diagUp:     { elevation:[20,35,55,75],  elbow:[125,150,180,181] },
+  diagDown:   { elevation:[100,120,150,168], elbow:[130,155,180,181], wristDist:[0.15,0.3,1.0,1.3] },
+  rest:       { elevation:[140,160,180,181], wristDist:[0,0,0.3,0.55] },
+  handsTogether: { closeUnder:0.32, closeOver:0.75 },
+  throwForwardArm: { elevation:[45,60,95,120], elbow:[115,145,180,181] },
+  throwForwardOneArm: { elevation:[55,70,110,125], elbow:[90,120,180,181] },
+  notStraight: { elevation:[65,78,100,115], elbow:[150,165,180,181] },
+  collapsingArm: { elevation:[90,110,160,176], elbow:[90,120,170,181] },
+  overTheTop: { elevation:[115,130,160,175], elbow:[140,160,180,181] },
+  visibility: { reliableMin: 0.5, occludedRestScore: 0.6 }
+};
+
+function visibilityFactor(f){ return Math.min(1, f.visibility / CONFIG.visibility.reliableMin); }
+
+function trapezoid(value, [a,b,c,d]){
+  if (value <= a || value >= d) return 0;
+  if (value >= b && value <= c) return 1;
+  if (value < b) return (value - a) / (b - a);
+  return (d - value) / (d - c);
+}
+function closeness(value, a, b){
+  if (value <= a) return 1;
+  if (value >= b) return 0;
+  return (b - value) / (b - a);
+}
+
+function overheadArmScore(f){ return trapezoid(f.elevation, CONFIG.overhead.elevation) * trapezoid(f.elbowBend, CONFIG.overhead.elbow) * visibilityFactor(f); }
+function horizontalArmScore(f){ return trapezoid(f.elevation, CONFIG.horizontal.elevation) * trapezoid(f.elbowBend, CONFIG.horizontal.elbow) * visibilityFactor(f); }
+function diagUpArmScore(f){ return trapezoid(f.elevation, CONFIG.diagUp.elevation) * trapezoid(f.elbowBend, CONFIG.diagUp.elbow) * visibilityFactor(f); }
+function diagDownArmScore(f){ return trapezoid(f.elevation, CONFIG.diagDown.elevation) * trapezoid(f.elbowBend, CONFIG.diagDown.elbow) * trapezoid(f.wristHipDist, CONFIG.diagDown.wristDist) * visibilityFactor(f); }
+function restArmScore(f){
+  if (f.visibility < CONFIG.visibility.reliableMin) return CONFIG.visibility.occludedRestScore;
+  return trapezoid(f.elevation, CONFIG.rest.elevation) * trapezoid(f.wristHipDist, CONFIG.rest.wristDist);
+}
+function overTheTopArmScore(f){ return trapezoid(f.elevation, CONFIG.overTheTop.elevation) * trapezoid(f.elbowBend, CONFIG.overTheTop.elbow) * visibilityFactor(f); }
+function throwForwardArmScore(f){ return trapezoid(f.elevation, CONFIG.throwForwardArm.elevation) * trapezoid(f.elbowBend, CONFIG.throwForwardArm.elbow) * visibilityFactor(f); }
+function throwForwardOneArmScore(f){ return trapezoid(f.elevation, CONFIG.throwForwardOneArm.elevation) * trapezoid(f.elbowBend, CONFIG.throwForwardOneArm.elbow) * visibilityFactor(f); }
+function notStraightArmScore(f){ return trapezoid(f.elevation, CONFIG.notStraight.elevation) * trapezoid(f.elbowBend, CONFIG.notStraight.elbow) * visibilityFactor(f); }
+function collapsingArmScore(f){ return trapezoid(f.elevation, CONFIG.collapsingArm.elevation) * trapezoid(f.elbowBend, CONFIG.collapsingArm.elbow) * visibilityFactor(f); }
+
+const SIGNAL_DEFS = [
+  { id:'knockOn',      ja:'ノックオン',       en:'Knock-on' },
+  { id:'offside',      ja:'オフサイド',       en:'Offside' },
+  { id:'penaltyTry',   ja:'ペナルティトライ', en:'Penalty Try' },
+  { id:'advantage',    ja:'アドバンテージ',   en:'Advantage' },
+  { id:'throwForward', ja:'スローフォワード', en:'Forward Pass' },
+  { id:'notStraight',  ja:'ノットストレート', en:'Not Straight' },
+  { id:'collapsing',   ja:'コラプシング',     en:'Collapsing' },
+  { id:'overTheTop',   ja:'倒れ込み',         en:'Over the Top' }
+];
+
+/**
+ * Classifier interface: classify(landmarks) -> { scores:{id:number}, features }.
+ * To move to ML later, implement the same interface (e.g. MLSignalClassifier)
+ * and swap the `classifier` instance below -- nothing else needs to change.
+ */
+class RuleBasedSignalClassifier{
+  classify(landmarks){
+    const f = extractFeatures(landmarks);
+    const L = f.left, R = f.right;
+    const crossedBonus = closeness(f.wristToWristDist, CONFIG.handsTogether.closeUnder, CONFIG.handsTogether.closeOver);
+
+    const scores = {
+      penaltyTry: overheadArmScore(L) * overheadArmScore(R),
+      collapsing: collapsingArmScore(L) * collapsingArmScore(R) * crossedBonus,
+      throwForward: Math.max(
+        throwForwardArmScore(L) * throwForwardArmScore(R),
+        0.85 * Math.max(0.75*throwForwardOneArmScore(L) + 0.25*restArmScore(R), 0.75*throwForwardOneArmScore(R) + 0.25*restArmScore(L))
+      ),
+      knockOn:    Math.max(0.75*horizontalArmScore(L) + 0.25*restArmScore(R), 0.75*horizontalArmScore(R) + 0.25*restArmScore(L)),
+      offside:    Math.max(0.75*diagUpArmScore(L) + 0.25*restArmScore(R), 0.75*diagUpArmScore(R) + 0.25*restArmScore(L)),
+      advantage:  Math.max(0.75*diagDownArmScore(L) + 0.25*restArmScore(R), 0.75*diagDownArmScore(R) + 0.25*restArmScore(L)),
+      notStraight: Math.max(0.75*notStraightArmScore(L) + 0.25*restArmScore(R), 0.75*notStraightArmScore(R) + 0.25*restArmScore(L)),
+      overTheTop: Math.max(0.75*overTheTopArmScore(L) + 0.25*restArmScore(R), 0.75*overTheTopArmScore(R) + 0.25*restArmScore(L))
+    };
+    return { scores, features: f };
+  }
+}
+
+function normalizeScores(scores){
+  const ids = Object.keys(scores);
+  const total = ids.reduce((s,k)=> s + scores[k], 0);
+  const out = {};
+  if (total < 1e-6){ ids.forEach(k => out[k] = 1/ids.length); }
+  else { ids.forEach(k => out[k] = scores[k] / total); }
+  return out;
+}
+
+const classifier = new RuleBasedSignalClassifier();
+
+const SKELETON_CONNECTIONS = [
+  [11,12],[11,13],[13,15],[12,14],[14,16],
+  [11,23],[12,24],[23,24],
+  [23,25],[25,27],[24,26],[26,28]
+];
+const ARM_POINTS = new Set([11,12,13,14,15,16]);
+
+function drawSkeleton(ctx, landmarks, w, h){
+  ctx.lineWidth = Math.max(2, w * 0.004);
+  SKELETON_CONNECTIONS.forEach(([i,j])=>{
+    const a = landmarks[i], b = landmarks[j];
+    if (!a || !b) return;
+    const arm = ARM_POINTS.has(i) && ARM_POINTS.has(j);
+    ctx.strokeStyle = arm ? '#D8B23A' : 'rgba(95,169,124,0.85)';
+    ctx.beginPath();
+    ctx.moveTo(a.x * w, a.y * h);
+    ctx.lineTo(b.x * w, b.y * h);
+    ctx.stroke();
+  });
+  Object.values(LM).forEach(idx=>{
+    const p = landmarks[idx];
+    if (!p) return;
+    ctx.fillStyle = ARM_POINTS.has(idx) ? '#D8B23A' : '#5FA97C';
+    ctx.beginPath();
+    ctx.arc(p.x * w, p.y * h, Math.max(3, w*0.007), 0, Math.PI*2);
+    ctx.fill();
+  });
+}
+
+/* =========================================================================
+   CAMERA + REALTIME LOOP
+   ========================================================================= */
+const video       = document.getElementById('video');
+const viewCanvas  = document.getElementById('view');
+const viewCtx     = viewCanvas.getContext('2d');
+const startScreen = document.getElementById('startScreen');
+const startBtn    = document.getElementById('startBtn');
+const controls    = document.getElementById('controls');
+const flipBtn     = document.getElementById('flipBtn');
+const stopBtn     = document.getElementById('stopBtn');
+const logBtn      = document.getElementById('logBtn');
+const logDrawer   = document.getElementById('logDrawer');
+const logCloseBtn = document.getElementById('logCloseBtn');
+const logClearBtn = document.getElementById('logClearBtn');
+const logList     = document.getElementById('logList');
+const liveDot     = document.getElementById('liveDot');
+const liveText    = document.getElementById('liveText');
+const confMini    = document.getElementById('confMini');
+const foulBanner  = document.getElementById('foulBanner');
+const foulName    = document.getElementById('foulName');
+const foulConf    = document.getElementById('foulConf');
+const errorOverlay = document.getElementById('errorOverlay');
+const errorText    = document.getElementById('errorText');
+const errorCloseBtn = document.getElementById('errorCloseBtn');
+
+let pose = null;
+let stream = null;
+let running = false;
+let facingMode = 'environment';
+let processInterval = 260; // ms between pose inferences -- tune down for a faster phone, up for an older one
+let lastSendTime = 0;
+let loopHandle = null;
+
+// Temporal voting: only "announce" a signal once it's held consistently
+// across several recent frames, rather than reacting to a single noisy frame.
+const VOTE_WINDOW = 6;
+const VOTE_MIN_AGREE = 4;
+const ANNOUNCE_CONF_THRESHOLD = 0.4;
+const COOLDOWN_MS = 4000;
+let recentVotes = [];
+let lastAnnouncedId = null;
+let lastAnnouncedTime = 0;
+let bannerHideTimer = null;
+
+function showError(msg){
+  errorText.textContent = msg;
+  errorOverlay.classList.add('show');
+}
+
+function initPose(){
+  if (typeof Pose === 'undefined'){
+    throw new Error('MediaPipeライブラリ（Pose）の読み込みに失敗しました。\ncdn.jsdelivr.net への通信がブロックされていないか確認してください。\n（file:// で直接開いた場合はネットワーク自体は通ることが多いですが、それでも失敗する場合は接続環境をご確認ください）');
+  }
+  pose = new Pose({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}` });
+  pose.setOptions({
+    modelComplexity: 1,       // balanced for real-time video (vs. 2 used for single-photo analysis)
+    smoothLandmarks: true,    // reduces jitter between frames, useful for continuous video
+    enableSegmentation: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  pose.onResults(onPoseResults);
+}
+
+async function startCamera(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+  } catch(err){
+    console.error(err);
+    let msg = 'カメラにアクセスできませんでした。';
+    if (err && err.name === 'NotAllowedError') msg = 'カメラの使用が許可されませんでした。ブラウザの設定でカメラ権限を許可してください。';
+    else if (err && err.name === 'NotFoundError') msg = 'カメラが見つかりませんでした。';
+    else if (location.protocol !== 'https:' && !['localhost','127.0.0.1'].includes(location.hostname)){
+      msg = 'カメラにはHTTPS、またはlocalhostでの表示が必要です。\nfile:// で直接開いている場合はカメラ権限が出ない場合があります。ローカルサーバー経由（http://localhost:...）か、HTTPSで公開したページから開いてください。';
+    } else {
+      msg += '\n' + (err && err.message ? err.message : String(err));
+    }
+    showError(msg);
+    throw err;
+  }
+
+  video.srcObject = stream;
+  await video.play();
+  await new Promise(resolve => {
+    if (video.readyState >= 2) return resolve();
+    video.onloadedmetadata = () => resolve();
+  });
+
+  viewCanvas.width = video.videoWidth;
+  viewCanvas.height = video.videoHeight;
+}
+
+function stopCamera(){
+  if (stream){
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+}
+
+async function startAll(){
+  try{
+    if (!pose) initPose();
+    await startCamera();
+    running = true;
+    startScreen.style.display = 'none';
+    controls.style.display = 'flex';
+    liveDot.classList.add('on');
+    liveText.textContent = '検出中';
+    recentVotes = [];
+    lastAnnouncedId = null;
+    runLoop();
+  } catch(err){
+    console.error(err);
+    if (!errorOverlay.classList.contains('show')){
+      showError((err && err.message) ? err.message : String(err));
+    }
+  }
+}
+
+function stopAll(){
+  running = false;
+  stopCamera();
+  liveDot.classList.remove('on');
+  liveText.textContent = '停止中';
+  controls.style.display = 'none';
+  startScreen.style.display = 'flex';
+  viewCtx.clearRect(0,0,viewCanvas.width, viewCanvas.height);
+}
+
+async function runLoop(){
+  if (!running) return;
+  const now = performance.now();
+  if (video.readyState >= 2 && (now - lastSendTime) >= processInterval){
+    lastSendTime = now;
+    try{
+      await pose.send({ image: video });
+    } catch(err){
+      console.error(err);
+    }
+  }
+  loopHandle = requestAnimationFrame(runLoop);
+}
+
+function onPoseResults(results){
+  const w = viewCanvas.width, h = viewCanvas.height;
+  viewCtx.save();
+  viewCtx.drawImage(results.image, 0, 0, w, h);
+
+  if (!results.poseLandmarks){
+    confMini.innerHTML = '<div class="row">人物を検出できません</div>';
+    recentVotes = [];
+    viewCtx.restore();
+    return;
+  }
+
+  drawSkeleton(viewCtx, results.poseLandmarks, w, h);
+  viewCtx.restore();
+
+  const { scores } = classifier.classify(results.poseLandmarks);
+  const confidences = normalizeScores(scores);
+  const ranked = SIGNAL_DEFS
+    .map(d => ({ ...d, conf: confidences[d.id] ?? 0 }))
+    .sort((a,b) => b.conf - a.conf);
+
+  renderMiniPanel(ranked);
+  registerVote(ranked[0]);
+}
+
+function renderMiniPanel(ranked){
+  confMini.innerHTML = ranked.slice(0,3).map((r,i) =>
+    `<div class="row${i===0?' top':''}"><span>${r.ja}</span><span>${Math.round(r.conf*100)}%</span></div>`
+  ).join('');
+}
+
+function registerVote(top){
+  recentVotes.push({ id: top.id, ja: top.ja, conf: top.conf });
+  if (recentVotes.length > VOTE_WINDOW) recentVotes.shift();
+  if (recentVotes.length < VOTE_MIN_AGREE) return;
+
+  const counts = {};
+  recentVotes.forEach(v => { counts[v.id] = (counts[v.id] || 0) + 1; });
+  let bestId = null, bestCount = 0;
+  Object.entries(counts).forEach(([id,c]) => { if (c > bestCount){ bestCount = c; bestId = id; } });
+  if (bestCount < VOTE_MIN_AGREE) return;
+
+  const agreeing = recentVotes.filter(v => v.id === bestId);
+  const avgConf = agreeing.reduce((s,v)=>s+v.conf,0) / agreeing.length;
+  if (avgConf < ANNOUNCE_CONF_THRESHOLD) return;
+
+  const now = performance.now();
+  const isRepeat = (bestId === lastAnnouncedId) && (now - lastAnnouncedTime < COOLDOWN_MS);
+  if (isRepeat) return;
+
+  lastAnnouncedId = bestId;
+  lastAnnouncedTime = now;
+  announce(agreeing[0].ja, avgConf);
+  recentVotes = [];
+}
+
+function announce(ja, conf){
+  foulName.textContent = ja;
+  foulConf.textContent = '信頼度 ' + Math.round(conf*100) + '%';
+  foulBanner.classList.add('show');
+  clearTimeout(bannerHideTimer);
+  bannerHideTimer = setTimeout(() => foulBanner.classList.remove('show'), 3200);
+
+  addLogEntry(ja, conf);
+}
+
+function addLogEntry(ja, conf){
+  const emptyMsg = document.getElementById('logEmpty');
+  if (emptyMsg) emptyMsg.remove();
+  const li = document.createElement('li');
+  const t = new Date();
+  const timeStr = String(t.getHours()).padStart(2,'0') + ':' + String(t.getMinutes()).padStart(2,'0') + ':' + String(t.getSeconds()).padStart(2,'0');
+  li.innerHTML = `<span>${ja}</span><span class="lt">${timeStr}・${Math.round(conf*100)}%</span>`;
+  logList.prepend(li);
+}
+
+/* ---- controls ---- */
+startBtn.addEventListener('click', startAll);
+stopBtn.addEventListener('click', stopAll);
+
+flipBtn.addEventListener('click', async () => {
+  facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+  stopCamera();
+  try{
+    await startCamera();
+  } catch(err){ /* already surfaced via showError */ }
+});
+
+logBtn.addEventListener('click', () => logDrawer.classList.add('open'));
+logCloseBtn.addEventListener('click', () => logDrawer.classList.remove('open'));
+logClearBtn.addEventListener('click', () => {
+  logList.innerHTML = '<li id="logEmpty" style="border-bottom:none;">まだ検出履歴はありません。</li>';
+});
+
+errorCloseBtn.addEventListener('click', () => {
+  errorOverlay.classList.remove('show');
+  stopAll();
+});
+
+// initial empty state for the log list
+logList.innerHTML = '<li id="logEmpty" style="border-bottom:none;">まだ検出履歴はありません。</li>';
+</script>
+</body>
+</html>
