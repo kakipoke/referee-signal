@@ -494,11 +494,15 @@ function extractFeatures(landmarks){
   const hipMid       = { x:(lh.x+rh.x)/2, y:(lh.y+rh.y)/2 };
   const torsoLength  = Math.max(dist(shoulderMid, hipMid), 1e-4);
 
+  // "chest" = a point 30% of the way down from the shoulder line to the hip line
+  const chest = { x: shoulderMid.x + 0.3 * (hipMid.x - shoulderMid.x), y: shoulderMid.y + 0.3 * (hipMid.y - shoulderMid.y) };
+
   function armFeatures(shoulder, elbow, wrist, hip){
     return {
       elevation: elevationAngle(shoulder, elbow),
       elbowBend: elbowBendAngle(shoulder, elbow, wrist),
       wristHipDist: dist(wrist, hip) / torsoLength,
+      wristChestDist: dist(wrist, chest) / torsoLength,
       visibility: Math.min(shoulder.visibility ?? 1, elbow.visibility ?? 1, wrist.visibility ?? 1)
     };
   }
@@ -526,6 +530,10 @@ const CONFIG = {
   notStraight: { elevation:[65,78,100,115], elbow:[150,165,180,181] },
   collapsingArm: { elevation:[90,110,160,176], elbow:[90,120,170,181] },
   overTheTop: { elevation:[115,130,160,175], elbow:[140,160,180,181] },
+  // Not releasing the ball: both hands held close to the chest "as if holding an imaginary ball"
+  notReleasing: { elevation:[70,100,175,181], elbow:[20,45,120,150], wristChest:[0.5,0.95], wristsApart:[0.55,1.0] },
+  // Not rolling away: forearm circles about the elbow, away from the body (needs MOTION; pose barely matters)
+  rollAway: { elevation:[30,55,180,181], elbow:[20,45,180,181], motion:[0.03,0.12] },   // forearm turns about the elbow: upper arm can hang by the body
   visibility: { reliableMin: 0.5, occludedRestScore: 0.6 }
 };
 
@@ -555,6 +563,13 @@ function overTheTopArmScore(f){ return trapezoid(f.elevation, CONFIG.overTheTop.
 function throwForwardArmScore(f){ return trapezoid(f.elevation, CONFIG.throwForwardArm.elevation) * trapezoid(f.elbowBend, CONFIG.throwForwardArm.elbow) * visibilityFactor(f); }
 function throwForwardOneArmScore(f){ return trapezoid(f.elevation, CONFIG.throwForwardOneArm.elevation) * trapezoid(f.elbowBend, CONFIG.throwForwardOneArm.elbow) * visibilityFactor(f); }
 function notStraightArmScore(f){ return trapezoid(f.elevation, CONFIG.notStraight.elevation) * trapezoid(f.elbowBend, CONFIG.notStraight.elbow) * visibilityFactor(f); }
+function notReleasingArmScore(f){
+  return closeness(f.wristChestDist, CONFIG.notReleasing.wristChest[0], CONFIG.notReleasing.wristChest[1])
+       * trapezoid(f.elbowBend, CONFIG.notReleasing.elbow)
+       * trapezoid(f.elevation, CONFIG.notReleasing.elevation) * visibilityFactor(f);
+}
+function rollAwayGeomScore(f){ return trapezoid(f.elevation, CONFIG.rollAway.elevation) * trapezoid(f.elbowBend, CONFIG.rollAway.elbow) * visibilityFactor(f); }
+function ramp(v, a, b){ return v <= a ? 0 : v >= b ? 1 : (v - a) / (b - a); }
 function collapsingArmScore(f){ return trapezoid(f.elevation, CONFIG.collapsingArm.elevation) * trapezoid(f.elbowBend, CONFIG.collapsingArm.elbow) * visibilityFactor(f); }
 
 const SIGNAL_DEFS = [
@@ -565,8 +580,57 @@ const SIGNAL_DEFS = [
   { id:'throwForward', ja:'スローフォワード', en:'Forward Pass' },
   { id:'notStraight',  ja:'ノットストレート', en:'Not Straight' },
   { id:'collapsing',   ja:'コラプシング',     en:'Collapsing' },
-  { id:'overTheTop',   ja:'倒れ込み',         en:'Over the Top' }
+  { id:'overTheTop',   ja:'倒れ込み',         en:'Over the Top' },
+  { id:'notReleasing', ja:'ノットリリースザボール', en:'Not Releasing the Ball' },
+  { id:'notRollingAway', ja:'ノットロールアウェイ', en:'Not Rolling Away' }
 ];
+
+/**
+ * Arm MOTION over the last couple of seconds. One frame can't show a hand circling, so the
+ * tracker keeps recent forearm directions (elbow -> wrist). A held arm has an almost constant
+ * direction (spread ~ 0); a circling hand sweeps the direction around (spread 0.1 .. 0.5).
+ * spread = 1 - |mean of unit direction vectors|  (circular variance, 0..1, independent of speed
+ * and of the camera frame rate -- circling faster than the frame rate still reads as motion).
+ */
+class MotionTracker{
+  constructor(){ this.hist = []; }
+  reset(){ this.hist = []; }
+  push(lm, nowMs){
+    const last = this.hist[this.hist.length - 1];
+    if (last && nowMs - last.t > 1200) this.hist = [];            // gap (pose lost): start over
+    this.hist.push({ t: nowMs, lm });
+    this.hist = this.hist.filter(h => nowMs - h.t <= 2500).slice(-8);
+  }
+  spreadOf(elbowIdx, wristIdx, shoulderIdx, hipIdx){
+    if (this.hist.length < 4) return 0;
+    let cx = 0, cy = 0, n = 0, ex = 0, ey = 0, lenSum = 0;
+    const elb = [];
+    for (const h of this.hist){
+      const e = h.lm[elbowIdx], w = h.lm[wristIdx], sh = h.lm[shoulderIdx], hp = h.lm[hipIdx];
+      if (!e || !w || !sh || !hp || (e.visibility ?? 1) < 0.5 || (w.visibility ?? 1) < 0.5) continue;
+      const dx = w.x - e.x, dy = w.y - e.y, m = Math.hypot(dx, dy);
+      const T = Math.hypot(sh.x - hp.x, sh.y - hp.y);
+      if (m < 0.12 * T) continue;                                  // forearm too short to give a direction
+      cx += dx / m; cy += dy / m; n++; lenSum += m;
+      const rx = e.x - sh.x, ry = e.y - sh.y;                      // elbow position relative to the shoulder
+      elb.push([rx, ry]); ex += rx; ey += ry;
+    }
+    if (n < 4) return 0;
+    const spread = 1 - Math.hypot(cx / n, cy / n);
+    // The gesture turns the forearm about a (roughly) fixed elbow. If the elbow itself travels a lot
+    // relative to the shoulder -- an arm being raised, swung or waved -- it is not that gesture.
+    ex /= n; ey /= n;
+    const drift = elb.reduce((s, [x, y]) => s + Math.hypot(x - ex, y - ey), 0) / n / (lenSum / n);
+    const elbowSteady = 1 - ramp(drift, 0.3, 0.7);
+    return spread * elbowSteady;
+  }
+  get(){
+    return {
+      left:  this.spreadOf(LM.LE, LM.LW, LM.LS, LM.LH),
+      right: this.spreadOf(LM.RE, LM.RW, LM.RS, LM.RH)
+    };
+  }
+}
 
 /**
  * Classifier interface: classify(landmarks) -> { scores:{id:number}, features }.
@@ -574,8 +638,9 @@ const SIGNAL_DEFS = [
  * and swap the `classifier` instance below -- nothing else needs to change.
  */
 class RuleBasedSignalClassifier{
-  classify(landmarks){
+  classify(landmarks, context){
     const f = extractFeatures(landmarks);
+    const motion = (context && context.motion) || { left: 0, right: 0 };
     const L = f.left, R = f.right;
     const crossedBonus = closeness(f.wristToWristDist, CONFIG.handsTogether.closeUnder, CONFIG.handsTogether.closeOver);
 
@@ -585,9 +650,12 @@ class RuleBasedSignalClassifier{
     // the normalised confidences (best class stuck around 30%). Multiplying keeps zero-evidence
     // classes at zero while still tolerating an off-arm that isn't perfectly at rest.
     const soft = (sig, rest) => sig * (0.75 + 0.25 * rest);
+    // An arm that is clearly MOVING (hand circling) is the ノットロールアウェイ gesture, not a held
+    // pose, so the held-pose scores of that arm are cut to 30% while it moves.
+    const heldFactor = (m) => 1 - 0.7 * ramp(m, ...CONFIG.rollAway.motion);
     const oneArm = (armScore) => Math.max(
-      soft(armScore(L), restArmScore(R)),
-      soft(armScore(R), restArmScore(L))
+      soft(armScore(L) * heldFactor(motion.left),  restArmScore(R)),
+      soft(armScore(R) * heldFactor(motion.right), restArmScore(L))
     );
 
     const scores = {
@@ -601,7 +669,14 @@ class RuleBasedSignalClassifier{
       offside:     oneArm(diagUpArmScore),
       advantage:   oneArm(diagDownArmScore),
       notStraight: oneArm(notStraightArmScore),
-      overTheTop:  oneArm(overTheTopArmScore)
+      overTheTop:  oneArm(overTheTopArmScore),
+      notReleasing: notReleasingArmScore(L) * notReleasingArmScore(R)
+                    * closeness(f.wristToWristDist, CONFIG.notReleasing.wristsApart[0], CONFIG.notReleasing.wristsApart[1]),
+      // needs motion: with no motion history (or a still arm) this stays at 0
+      notRollingAway: Math.max(
+        soft(rollAwayGeomScore(L) * ramp(motion.left,  ...CONFIG.rollAway.motion), restArmScore(R)),
+        soft(rollAwayGeomScore(R) * ramp(motion.right, ...CONFIG.rollAway.motion), restArmScore(L))
+      )
     };
     return { scores, features: f };
   }
@@ -1308,6 +1383,7 @@ const JUDGE_MAX_MS = 10000;            // hard cap per window
 const IDLE_SCAN_MS = 400;
 const judge = { preferWhistle: true, whistleMode: true, micOk: false, active: false, openedAt: 0, lastEnd: 0, whistling: false, announced: false, source: '' };
 let lastIdleTime = 0;
+const motionTracker = new MotionTracker();
 
 function judgingNow(now){
   if (!judge.whistleMode) return true;
@@ -1333,6 +1409,7 @@ function openJudgeWindow(source){
   if (!judge.active){
     judge.active = true; judge.openedAt = now; judge.announced = false;
     recentVotes = [];
+    motionTracker.reset();
     lastSendTime = 0;                  // first inference on the very next frame
     track.overlay = null;
   }
@@ -1603,7 +1680,8 @@ async function fullFrameTick(){
 }
 
 function applyPose(px){
-  const { scores } = classifier.classify(px);
+  motionTracker.push(px, performance.now());
+  const { scores } = classifier.classify(px, { motion: motionTracker.get() });
   const confidences = normalizeScores(scores);
   const ranked = SIGNAL_DEFS
     .map(d => ({ ...d, conf: confidences[d.id] ?? 0 }))
