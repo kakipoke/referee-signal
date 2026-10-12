@@ -51,8 +51,9 @@
     inset:0;
     width:100%;
     height:100%;
-    object-fit:cover;
+    object-fit:contain;      /* contain (not cover) so tap positions map 1:1 onto the video and nothing is cropped away */
     display:block;
+    touch-action:manipulation;
   }
   video#video{
     position:fixed;
@@ -155,7 +156,7 @@
   #foulBanner{
     position:absolute;
     left:50%;
-    top:14%;
+    top:18%;
     transform:translate(-50%,-16px);
     background:var(--surface-2);
     border:1px solid var(--accent);
@@ -193,25 +194,95 @@
     position:absolute;
     left:0;right:0;bottom:0;
     display:flex;
+    flex-wrap:wrap;
     align-items:center;
     justify-content:center;
-    gap:14px;
-    padding:14px 14px calc(14px + env(safe-area-inset-bottom));
+    gap:8px;
+    padding:14px 12px calc(14px + env(safe-area-inset-bottom));
     background:linear-gradient(to top, rgba(0,0,0,0.6), transparent);
     z-index:10;
   }
   .ctrl-btn{
     font-family:inherit;
-    font-size:0.82rem;
+    font-size:0.78rem;
     color:var(--text);
     background:rgba(18,52,32,0.75);
     border:1px solid var(--line);
-    padding:10px 16px;
+    padding:9px 12px;
     display:flex;
     align-items:center;
     gap:6px;
     cursor:pointer;
   }
+  .tol-row{
+    flex:1 1 100%;
+    display:none;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    font-size:0.74rem;
+    color:var(--muted);
+  }
+  .tol-row input[type=range]{
+    width:min(52vw,220px);
+    accent-color:var(--accent);
+  }
+  .tol-row .tol-val{
+    min-width:2ch;
+    color:var(--text);
+    font-variant-numeric:tabular-nums;
+  }
+
+  /* ---- referee selection hint + toast ---- */
+  #hintBar{
+    position:absolute;
+    left:50%;
+    top:calc(64px + env(safe-area-inset-top));
+    transform:translateX(-50%);
+    display:none;
+    flex-direction:column;
+    align-items:center;
+    gap:8px;
+    z-index:12;
+    width:max-content;
+    max-width:90vw;
+    text-align:center;
+  }
+  #hintBar.show{ display:flex; }
+  #hintText{
+    background:var(--surface-2);
+    border:1px solid var(--accent);
+    padding:10px 16px;
+    font-size:0.9rem;
+  }
+  #hintText.warn{ border-color:var(--red); color:var(--red); }
+  .mini-btn{
+    font-family:inherit;
+    font-size:0.74rem;
+    color:var(--muted);
+    background:rgba(0,0,0,0.45);
+    border:1px solid var(--line);
+    padding:6px 12px;
+    cursor:pointer;
+  }
+  #toast{
+    position:absolute;
+    left:50%;
+    top:calc(58px + env(safe-area-inset-top));
+    transform:translateX(-50%);
+    background:var(--surface-2);
+    border:1px solid var(--accent-2);
+    padding:8px 14px;
+    font-size:0.8rem;
+    z-index:16;
+    max-width:88vw;
+    text-align:center;
+    opacity:0;
+    pointer-events:none;
+    transition:opacity .25s ease;
+  }
+  #toast.show{ opacity:1; }
+  #toast.warn{ border-color:var(--red); }
   .ctrl-btn:active{ background:rgba(18,52,32,0.95); }
   .ctrl-btn.stop{ border-color:var(--red); color:var(--red); }
   .ctrl-btn.primary{ border-color:var(--accent); color:var(--accent); }
@@ -307,14 +378,26 @@
       <div class="conf" id="foulConf"></div>
     </div>
 
+    <div id="hintBar">
+      <div id="hintText">レフェリーのシャツをタップして選択してください</div>
+      <button class="mini-btn" id="skipSelectBtn">選択せず全体を検出</button>
+    </div>
+    <div id="toast"></div>
+
     <div id="startScreen">
       <h1 class="display">レフェリーシグナル判定<br>（カメラ版）</h1>
-      <p>カメラをレフェリーに向けると、反則のシグナルをリアルタイムで検出します。</p>
+      <p>カメラを向けて、画面上のレフェリーをタップ。シャツの色を覚えて、レフェリーだけを追跡して反則シグナルを検出します。</p>
       <button id="startBtn">カメラを開始</button>
       <div class="privacy-note">🔒 映像は一切外部送信されません。骨格推定・判定はすべて端末内（ブラウザ内）で処理されます。</div>
     </div>
 
     <div id="controls" style="display:none;">
+      <div class="tol-row" id="tolRow">
+        <span>色の許容度</span>
+        <input type="range" id="tolSlider" min="10" max="45" step="1" value="26">
+        <span class="tol-val" id="tolVal">26</span>
+      </div>
+      <button class="ctrl-btn" id="reselectBtn">🎯 再選択</button>
       <button class="ctrl-btn" id="flipBtn">🔄 前後切替</button>
       <button class="ctrl-btn stop" id="stopBtn">■ 停止</button>
       <button class="ctrl-btn primary" id="logBtn">📋 履歴</button>
@@ -461,18 +544,29 @@ class RuleBasedSignalClassifier{
     const L = f.left, R = f.right;
     const crossedBonus = closeness(f.wristToWristDist, CONFIG.handsTogether.closeUnder, CONFIG.handsTogether.closeOver);
 
+    // One-arm signals: the SIGNALLING arm decides; the other arm only nudges the score between
+    // x0.75 (not resting) and x1.0 (resting). Earlier versions used 0.75*signal + 0.25*rest, which
+    // handed EVERY one-arm class a constant 0.25 whenever the other arm hung down -- that flattened
+    // the normalised confidences (best class stuck around 30%). Multiplying keeps zero-evidence
+    // classes at zero while still tolerating an off-arm that isn't perfectly at rest.
+    const soft = (sig, rest) => sig * (0.75 + 0.25 * rest);
+    const oneArm = (armScore) => Math.max(
+      soft(armScore(L), restArmScore(R)),
+      soft(armScore(R), restArmScore(L))
+    );
+
     const scores = {
       penaltyTry: overheadArmScore(L) * overheadArmScore(R),
       collapsing: collapsingArmScore(L) * collapsingArmScore(R) * crossedBonus,
       throwForward: Math.max(
         throwForwardArmScore(L) * throwForwardArmScore(R),
-        0.85 * Math.max(0.75*throwForwardOneArmScore(L) + 0.25*restArmScore(R), 0.75*throwForwardOneArmScore(R) + 0.25*restArmScore(L))
+        0.85 * oneArm(throwForwardOneArmScore)
       ),
-      knockOn:    Math.max(0.75*horizontalArmScore(L) + 0.25*restArmScore(R), 0.75*horizontalArmScore(R) + 0.25*restArmScore(L)),
-      offside:    Math.max(0.75*diagUpArmScore(L) + 0.25*restArmScore(R), 0.75*diagUpArmScore(R) + 0.25*restArmScore(L)),
-      advantage:  Math.max(0.75*diagDownArmScore(L) + 0.25*restArmScore(R), 0.75*diagDownArmScore(R) + 0.25*restArmScore(L)),
-      notStraight: Math.max(0.75*notStraightArmScore(L) + 0.25*restArmScore(R), 0.75*notStraightArmScore(R) + 0.25*restArmScore(L)),
-      overTheTop: Math.max(0.75*overTheTopArmScore(L) + 0.25*restArmScore(R), 0.75*overTheTopArmScore(R) + 0.25*restArmScore(L))
+      knockOn:     oneArm(horizontalArmScore),
+      offside:     oneArm(diagUpArmScore),
+      advantage:   oneArm(diagDownArmScore),
+      notStraight: oneArm(notStraightArmScore),
+      overTheTop:  oneArm(overTheTopArmScore)
     };
     return { scores, features: f };
   }
@@ -489,6 +583,287 @@ function normalizeScores(scores){
 
 const classifier = new RuleBasedSignalClassifier();
 
+/* =========================================================================
+   REFEREE LOCK-ON -- pure helpers (colour model, blob search, ROI geometry).
+   No DOM / globals inside this block, so it can be unit-tested under Node.
+
+   Idea: the referee's shirt colour differs from both teams' jerseys. The user
+   taps the referee once; we remember that colour (CIELAB), then every tick we
+     1. find the colour blob in a small downscaled copy of the frame,
+     2. cut a body-sized region around it out of the full frame,
+     3. run pose estimation ONLY on that crop,
+     4. double-check that the torso of the detected skeleton really has the
+        referee's shirt colour (otherwise a neighbouring player was picked).
+   ========================================================================= */
+/* ===== REFEREE-PURE START ===== */
+const SRGB_LUT = (() => {
+  const t = new Float32Array(256);
+  for (let i = 0; i < 256; i++){
+    const c = i / 255;
+    t[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  return t;
+})();
+
+function rgbToLab(r, g, b, out, o){
+  const R = SRGB_LUT[r], G = SRGB_LUT[g], B = SRGB_LUT[b];
+  const x = (0.4124564*R + 0.3575761*G + 0.1804375*B) / 0.95047;
+  const y =  0.2126729*R + 0.7151522*G + 0.0721750*B;
+  const z = (0.0193339*R + 0.1191920*G + 0.9503041*B) / 1.08883;
+  const fx = x > 0.008856 ? Math.cbrt(x) : 7.787*x + 16/116;
+  const fy = y > 0.008856 ? Math.cbrt(y) : 7.787*y + 16/116;
+  const fz = z > 0.008856 ? Math.cbrt(z) : 7.787*z + 16/116;
+  out[o]   = 116*fy - 16;
+  out[o+1] = 500*(fx - fy);
+  out[o+2] = 200*(fy - fz);
+}
+
+// Lightness counts half as much as hue/chroma, so sun/shade changes on the same
+// shirt don't break the match, while a different hue still does.
+const L_WEIGHT = 0.5;
+
+function labDistSqAt(lab, i, ref){
+  const dl = (lab[3*i]   - ref.L) * L_WEIGHT;
+  const da =  lab[3*i+1] - ref.a;
+  const db =  lab[3*i+2] - ref.b;
+  return dl*dl + da*da + db*db;
+}
+
+function buildMask(sc, ref, tol){
+  const n = sc.w * sc.h;
+  const mask = new Uint8Array(n);
+  const t2 = tol * tol;
+  let count = 0;
+  for (let i = 0; i < n; i++){
+    if (labDistSqAt(sc.lab, i, ref) <= t2){ mask[i] = 1; count++; }
+  }
+  return { mask, count };
+}
+
+// 3x3 dilation: glues together fragments of the same shirt (stripes, logos, arms).
+function dilate(mask, w, h){
+  const out = new Uint8Array(mask.length);
+  for (let y = 0; y < h; y++){
+    for (let x = 0; x < w; x++){
+      if (!mask[y*w + x]) continue;
+      const x0 = x > 0 ? x-1 : x, x1 = x < w-1 ? x+1 : x;
+      const y0 = y > 0 ? y-1 : y, y1 = y < h-1 ? y+1 : y;
+      for (let yy = y0; yy <= y1; yy++){
+        const row = yy * w;
+        for (let xx = x0; xx <= x1; xx++) out[row + xx] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+// Connected components over the dilated mask; statistics use the ORIGINAL mask pixels only.
+function findBlobs(mask, dil, sc){
+  const { w, h, lab } = sc;
+  const n = w * h;
+  const label = new Int32Array(n);
+  const queue = new Int32Array(n);
+  const blobs = [];
+  let id = 0;
+  for (let s = 0; s < n; s++){
+    if (!dil[s] || label[s]) continue;
+    id++;
+    let qh = 0, qt = 0;
+    queue[qt++] = s; label[s] = id;
+    let area = 0, sx = 0, sy = 0, sL = 0, sA = 0, sB = 0;
+    let minx = w, maxx = -1, miny = h, maxy = -1;
+    while (qh < qt){
+      const p = queue[qh++];
+      const x = p % w, y = (p / w) | 0;
+      if (mask[p]){
+        area++; sx += x; sy += y;
+        sL += lab[3*p]; sA += lab[3*p+1]; sB += lab[3*p+2];
+        if (x < minx) minx = x;
+        if (x > maxx) maxx = x;
+        if (y < miny) miny = y;
+        if (y > maxy) maxy = y;
+      }
+      if (x > 0)     { const q = p-1; if (dil[q] && !label[q]){ label[q] = id; queue[qt++] = q; } }
+      if (x < w-1)   { const q = p+1; if (dil[q] && !label[q]){ label[q] = id; queue[qt++] = q; } }
+      if (y > 0)     { const q = p-w; if (dil[q] && !label[q]){ label[q] = id; queue[qt++] = q; } }
+      if (y < h-1)   { const q = p+w; if (dil[q] && !label[q]){ label[q] = id; queue[qt++] = q; } }
+    }
+    if (area > 0){
+      blobs.push({ id, area, cx: sx/area, cy: sy/area, minx, maxx, miny, maxy,
+                   L: sL/area, a: sA/area, b: sB/area });
+    }
+  }
+  return { blobs, label };
+}
+
+// Reject specks, field lines (very elongated), sparse scatter, and anything absurdly large.
+function blobIsPlausible(b, sc){
+  const frame = sc.w * sc.h;
+  const bw = b.maxx - b.minx + 1, bh = b.maxy - b.miny + 1;
+  if (b.area < Math.max(8, frame * 0.00012)) return false;
+  if (b.area > frame * 0.35) return false;
+  const aspect = bh / bw;
+  if (aspect < 0.25 || aspect > 4) return false;
+  if (b.area / (bw * bh) < 0.18) return false;
+  return true;
+}
+
+// Prefer big blobs, but strongly prefer the one closest to where the referee was last seen.
+function pickBlob(blobs, sc, last){
+  const diag = Math.hypot(sc.w, sc.h);
+  let best = null, bestScore = 0;
+  for (const b of blobs){
+    if (!blobIsPlausible(b, sc)) continue;
+    let score = b.area;
+    if (last){
+      const d = Math.hypot(b.cx - last.cx, b.cy - last.cy) / diag;
+      score *= Math.exp(-d * 8);
+    }
+    if (score > bestScore){ bestScore = score; best = b; }
+  }
+  return best;
+}
+
+function distToBox(b, x, y){
+  const dx = x < b.minx ? b.minx - x : (x > b.maxx ? x - b.maxx : 0);
+  const dy = y < b.miny ? b.miny - y : (y > b.maxy ? y - b.maxy : 0);
+  return Math.hypot(dx, dy);
+}
+
+function nearestBlob(blobs, sx, sy, radius, sc){
+  let best = null, bestD = Infinity;
+  for (const b of blobs){
+    if (b.area < Math.max(6, sc.w * sc.h * 0.0001)) continue;
+    const d = distToBox(b, sx, sy);
+    if (d > radius) continue;
+    if (d < bestD - 1e-6 || (Math.abs(d - bestD) < 1e-6 && best && b.area > best.area)){
+      best = b; bestD = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * Turn a tap at scan pixel (sx, sy) into a shirt-colour model.
+ * Starts permissive and tightens the tolerance until the colour is distinctive:
+ *   - not much of the REST of the frame (grass, stands, other kit) shares it, and
+ *   - no OTHER person-sized blob of that colour remains (e.g. a red shirt next to an orange one).
+ * If another same-coloured blob can't be shaken off (assistant referee in the same kit),
+ * the loosest tolerance >= 20 is kept and the result is flagged `ambiguous`.
+ * Returns { ok:true, ref:{L,a,b}, tol, blob, ambiguous } or { ok:false, reason }.
+ */
+function selectReference(sc, sx, sy){
+  const px = (v, max) => Math.min(max, Math.max(0, v));
+  const Ls = [], As = [], Bs = [];
+  for (let dy = -2; dy <= 2; dy++){
+    for (let dx = -2; dx <= 2; dx++){
+      const i = px(sy + dy, sc.h - 1) * sc.w + px(sx + dx, sc.w - 1);
+      Ls.push(sc.lab[3*i]); As.push(sc.lab[3*i+1]); Bs.push(sc.lab[3*i+2]);
+    }
+  }
+  const med = (arr) => arr.slice().sort((p, q) => p - q)[arr.length >> 1];
+  const seed = { L: med(Ls), a: med(As), b: med(Bs) };
+
+  const frame = sc.w * sc.h;
+  let sawCommon = false;
+  let fallback = null, lastCand = null;
+  for (const tol of [28, 24, 20, 16, 12]){
+    const { mask, count } = buildMask(sc, seed, tol);
+    const dil = dilate(mask, sc.w, sc.h);
+    const { blobs, label } = findBlobs(mask, dil, sc);
+
+    const li = label[px(sy, sc.h - 1) * sc.w + px(sx, sc.w - 1)];
+    let blob = li ? blobs.find(b => b.id === li) : null;
+    if (!blob) blob = nearestBlob(blobs, sx, sy, 10, sc);
+    if (blob && blob.area > frame * 0.35){ sawCommon = true; continue; }   // e.g. the tap landed on grass
+    if (!blob || !blobIsPlausible(blob, sc)) continue;
+
+    const outside = (count - blob.area) / frame;   // same-coloured pixels that are NOT this blob
+    if (outside > 0.05){ sawCommon = true; continue; }
+
+    const competitors = blobs.filter(b => b.id !== blob.id && blobIsPlausible(b, sc)).length;
+    const cand = { ok: true, ref: { L: blob.L, a: blob.a, b: blob.b }, tol, blob, outside, competitors, ambiguous: false };
+    if (competitors === 0) return cand;             // unique at the loosest tolerance that achieves it
+    lastCand = cand;
+    if (tol >= 20) fallback = cand;                 // remember a reasonably tolerant candidate
+  }
+  const chosen = fallback || lastCand;
+  if (chosen) return { ...chosen, ambiguous: true };
+  return { ok: false, reason: sawCommon ? 'common' : 'noblob' };
+}
+
+// Blob -> video-pixel geometry. x-centre comes from the LOWER rows only (torso),
+// so an outstretched arm doesn't drag the centre sideways.
+function blobGeometry(blob, label, mask, sc){
+  const w = sc.w;
+  const lowerY = Math.ceil(blob.miny + (blob.maxy - blob.miny) * 0.55);
+  let sx = 0, n = 0;
+  for (let y = lowerY; y <= blob.maxy; y++){
+    for (let x = blob.minx; x <= blob.maxx; x++){
+      const i = y * w + x;
+      if (label[i] === blob.id && mask[i]){ sx += x; n++; }
+    }
+  }
+  const cxs = n ? sx / n : blob.cx;
+  const s = sc.scale;
+  return {
+    cx: (cxs + 0.5) * s,
+    bottom: (blob.maxy + 1) * s,
+    top: blob.miny * s,
+    bh: (blob.maxy - blob.miny + 1) * s,
+    bw: (blob.maxx - blob.minx + 1) * s,
+    x0: blob.minx * s, x1: (blob.maxx + 1) * s
+  };
+}
+
+// Torso length (shoulder->hip) guessed from the shirt blob before any skeleton is known.
+function estimateTorso(g, vh){
+  return Math.min(Math.max(g.bh * 0.9, vh * 0.05), vh * 0.4);
+}
+
+// Body-sized crop: from 3T above the hip line (room for raised arms) to 2.1T below
+// (legs), 2.3T to each side (room for arms held out). k < 1 gives a tighter retry crop.
+function makeRoi(g, T, k, vw, vh){
+  const cy = g.bottom - 0.45 * T;
+  const halfH = 2.55 * T * k, halfW = 2.3 * T * k;
+  const x0 = Math.max(0, g.cx - halfW), x1 = Math.min(vw, g.cx + halfW);
+  const y0 = Math.max(0, cy - halfH),   y1 = Math.min(vh, cy + halfH);
+  return { x0, y0, w: Math.max(32, x1 - x0), h: Math.max(32, y1 - y0) };
+}
+
+// MediaPipe returns landmarks normalised to the CROP. Convert to full-frame PIXELS:
+// pixels (not 0..1) are required so angles aren't distorted by the frame's aspect ratio.
+function toPixelLandmarks(lms, roi){
+  return lms.map(l => ({ x: roi.x0 + l.x * roi.w, y: roi.y0 + l.y * roi.h, visibility: l.visibility }));
+}
+
+// Is the skeleton's torso (shoulder-shoulder-hip-hip quad) actually wearing the referee's colour?
+function torsoMatches(px, sc, ref, tol){
+  const LS = px[11], RS = px[12], RH = px[24], LH = px[23];
+  if (!LS || !RS || !RH || !LH) return { ok: false, ratio: 0 };
+  if ((LS.visibility ?? 1) < 0.3 || (RS.visibility ?? 1) < 0.3) return { ok: false, ratio: 0 };
+  const t2 = (tol * 1.15) * (tol * 1.15);
+  let hit = 0, tot = 0;
+  for (let i = 0; i <= 4; i++){
+    for (let j = 0; j <= 4; j++){
+      const u = i / 4, v = j / 4;
+      const tx = LS.x + (RS.x - LS.x) * u, ty = LS.y + (RS.y - LS.y) * u;   // shoulder line
+      const bx = LH.x + (RH.x - LH.x) * u, by = LH.y + (RH.y - LH.y) * u;   // hip line
+      const x = Math.round((tx + (bx - tx) * v) / sc.scale);
+      const y = Math.round((ty + (by - ty) * v) / sc.scale);
+      if (x < 0 || y < 0 || x >= sc.w || y >= sc.h) continue;
+      tot++;
+      if (labDistSqAt(sc.lab, y * sc.w + x, ref) <= t2) hit++;
+    }
+  }
+  const ratio = tot ? hit / tot : 0;
+  return { ok: tot >= 10 && ratio >= 0.3, ratio };
+}
+/* ===== REFEREE-PURE END ===== */
+
+/* =========================================================================
+   SKELETON DRAWING (landmarks are in full-frame PIXELS)
+   ========================================================================= */
 const SKELETON_CONNECTIONS = [
   [11,12],[11,13],[13,15],[12,14],[14,16],
   [11,23],[12,24],[23,24],
@@ -496,24 +871,24 @@ const SKELETON_CONNECTIONS = [
 ];
 const ARM_POINTS = new Set([11,12,13,14,15,16]);
 
-function drawSkeleton(ctx, landmarks, w, h){
-  ctx.lineWidth = Math.max(2, w * 0.004);
-  SKELETON_CONNECTIONS.forEach(([i,j])=>{
-    const a = landmarks[i], b = landmarks[j];
+function drawSkeletonPx(ctx, lm, base){
+  ctx.lineWidth = Math.max(2, base * 0.004);
+  SKELETON_CONNECTIONS.forEach(([i,j]) => {
+    const a = lm[i], b = lm[j];
     if (!a || !b) return;
     const arm = ARM_POINTS.has(i) && ARM_POINTS.has(j);
     ctx.strokeStyle = arm ? '#D8B23A' : 'rgba(95,169,124,0.85)';
     ctx.beginPath();
-    ctx.moveTo(a.x * w, a.y * h);
-    ctx.lineTo(b.x * w, b.y * h);
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
     ctx.stroke();
   });
-  Object.values(LM).forEach(idx=>{
-    const p = landmarks[idx];
+  Object.values(LM).forEach(idx => {
+    const p = lm[idx];
     if (!p) return;
     ctx.fillStyle = ARM_POINTS.has(idx) ? '#D8B23A' : '#5FA97C';
     ctx.beginPath();
-    ctx.arc(p.x * w, p.y * h, Math.max(3, w*0.007), 0, Math.PI*2);
+    ctx.arc(p.x, p.y, Math.max(3, base * 0.007), 0, Math.PI*2);
     ctx.fill();
   });
 }
@@ -527,6 +902,7 @@ const viewCtx     = viewCanvas.getContext('2d');
 const startScreen = document.getElementById('startScreen');
 const startBtn    = document.getElementById('startBtn');
 const controls    = document.getElementById('controls');
+const reselectBtn = document.getElementById('reselectBtn');
 const flipBtn     = document.getElementById('flipBtn');
 const stopBtn     = document.getElementById('stopBtn');
 const logBtn      = document.getElementById('logBtn');
@@ -543,14 +919,42 @@ const foulConf    = document.getElementById('foulConf');
 const errorOverlay = document.getElementById('errorOverlay');
 const errorText    = document.getElementById('errorText');
 const errorCloseBtn = document.getElementById('errorCloseBtn');
+const hintBar       = document.getElementById('hintBar');
+const hintText      = document.getElementById('hintText');
+const skipSelectBtn = document.getElementById('skipSelectBtn');
+const toastEl       = document.getElementById('toast');
+const tolRow        = document.getElementById('tolRow');
+const tolSlider     = document.getElementById('tolSlider');
+const tolVal        = document.getElementById('tolVal');
+
+const SCAN_W = 320;        // width of the downscaled copy used for colour search
+const CROP_TARGET = 384;   // long side (px) of the crop handed to pose estimation
+const FULL_TARGET = 640;   // long side when running on the whole frame (no referee selected)
+const HINT_DEFAULT = 'レフェリーのシャツをタップして選択してください';
 
 let pose = null;
 let stream = null;
 let running = false;
 let facingMode = 'environment';
-let processInterval = 260; // ms between pose inferences -- tune down for a faster phone, up for an older one
+let processInterval = 260; // ms between inferences -- raise for an older phone, lower for a faster one
 let lastSendTime = 0;
 let loopHandle = null;
+let busy = false;
+
+// Referee tracking state.
+//   mode: idle (camera off) | select (waiting for the tap) | tracking (colour lock) | all (no lock, whole frame)
+const track = {
+  mode: 'idle',
+  ref: null,          // shirt colour {L,a,b}
+  tol: 26,            // colour tolerance (Lab distance, lightness down-weighted)
+  last: null,         // last blob centre in scan pixels, used to stay on the same person
+  lostTicks: 0,
+  T: null,            // smoothed torso length in video pixels (from the last accepted skeleton)
+  TArea: null,        // blob area when T was measured; used to notice big zoom/distance changes
+  prevCenter: null,
+  overlay: null,      // what to draw on top of the video
+  tapMark: null
+};
 
 // Temporal voting: only "announce" a signal once it's held consistently
 // across several recent frames, rather than reacting to a single noisy frame.
@@ -562,10 +966,39 @@ let recentVotes = [];
 let lastAnnouncedId = null;
 let lastAnnouncedTime = 0;
 let bannerHideTimer = null;
+let toastTimer = null;
+let hintTimer = null;
 
 function showError(msg){
   errorText.textContent = msg;
   errorOverlay.classList.add('show');
+}
+
+function toast(msg, warn){
+  toastEl.textContent = msg;
+  toastEl.classList.toggle('warn', !!warn);
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 3400);
+}
+
+function flashHint(msg){
+  hintText.textContent = msg;
+  hintText.classList.add('warn');
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => {
+    hintText.textContent = HINT_DEFAULT;
+    hintText.classList.remove('warn');
+  }, 4500);
+}
+
+function setLive(text, on){
+  liveText.textContent = text;
+  liveDot.classList.toggle('on', !!on);
+}
+
+function setMiniMessage(text){
+  confMini.innerHTML = '<div class="row">' + text + '</div>';
 }
 
 function initPose(){
@@ -574,8 +1007,8 @@ function initPose(){
   }
   pose = new Pose({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}` });
   pose.setOptions({
-    modelComplexity: 1,       // balanced for real-time video (vs. 2 used for single-photo analysis)
-    smoothLandmarks: true,    // reduces jitter between frames, useful for continuous video
+    modelComplexity: 1,       // balanced for real-time video
+    smoothLandmarks: false,   // OFF: the crop moves every frame, so MediaPipe's built-in smoothing/tracking would mix up coordinate frames
     enableSegmentation: false,
     minDetectionConfidence: 0.5,
     minTrackingConfidence: 0.5
@@ -583,6 +1016,301 @@ function initPose(){
   pose.onResults(onPoseResults);
 }
 
+/* ---- running pose estimation on an arbitrary canvas ---- */
+let resultResolver = null;
+function onPoseResults(results){
+  if (resultResolver){
+    const r = resultResolver;
+    resultResolver = null;
+    r(results);
+  }
+}
+
+async function inferOn(source){
+  const waiting = new Promise(resolve => { resultResolver = resolve; });
+  try{
+    await pose.send({ image: source });
+    return await Promise.race([waiting, new Promise(r => setTimeout(() => r(null), 1500))]);
+  } finally {
+    resultResolver = null;
+  }
+}
+
+const cropCanvas = document.createElement('canvas');
+const cropCtx = cropCanvas.getContext('2d');
+function cropToCanvas(roi, target){
+  const longSide = Math.max(roi.w, roi.h);
+  const scale = Math.min(Math.max(target / longSide, 0.25), 2.5);
+  const cw = Math.max(64, Math.round(roi.w * scale));
+  const ch = Math.max(64, Math.round(roi.h * scale));
+  cropCanvas.width = cw;           // (re)setting the size also clears the canvas
+  cropCanvas.height = ch;
+  cropCtx.imageSmoothingEnabled = true;
+  cropCtx.imageSmoothingQuality = 'high';
+  cropCtx.drawImage(video, roi.x0, roi.y0, roi.w, roi.h, 0, 0, cw, ch);
+  return cropCanvas;
+}
+
+/* ---- small downscaled frame with per-pixel Lab, used for colour search ---- */
+const scanCanvas = document.createElement('canvas');
+const scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+function captureScan(){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const w = SCAN_W, h = Math.max(1, Math.round(SCAN_W * vh / vw));
+  if (scanCanvas.width !== w || scanCanvas.height !== h){
+    scanCanvas.width = w;
+    scanCanvas.height = h;
+  }
+  scanCtx.drawImage(video, 0, 0, w, h);
+  const data = scanCtx.getImageData(0, 0, w, h).data;
+  const lab = new Float32Array(w * h * 3);
+  for (let i = 0, n = w * h; i < n; i++){
+    rgbToLab(data[4*i], data[4*i+1], data[4*i+2], lab, 3*i);
+  }
+  return { w, h, lab, scale: vw / w };
+}
+
+// Screen tap -> video pixel (the canvas is letterboxed with object-fit: contain).
+function clientToVideo(clientX, clientY){
+  const rect = viewCanvas.getBoundingClientRect();
+  const cw = viewCanvas.width, ch = viewCanvas.height;
+  if (!cw || !ch) return null;
+  const scale = Math.min(rect.width / cw, rect.height / ch);
+  const ox = rect.left + (rect.width  - cw * scale) / 2;
+  const oy = rect.top  + (rect.height - ch * scale) / 2;
+  const x = (clientX - ox) / scale, y = (clientY - oy) / scale;
+  if (x < 0 || y < 0 || x >= cw || y >= ch) return null;
+  return { x, y };
+}
+
+/* ---- modes ---- */
+function enterSelectMode(){
+  track.mode = 'select';
+  track.ref = null; track.last = null; track.T = null; track.TArea = null;
+  track.prevCenter = null; track.overlay = null; track.lostTicks = 0;
+  recentVotes = [];
+  hintText.textContent = HINT_DEFAULT;
+  hintText.classList.remove('warn');
+  hintBar.classList.add('show');
+  tolRow.style.display = 'none';
+  setLive('レフェリー選択待ち', false);
+  setMiniMessage('レフェリーをタップ');
+}
+
+function enterAllMode(){
+  track.mode = 'all';
+  track.overlay = null;
+  recentVotes = [];
+  hintBar.classList.remove('show');
+  tolRow.style.display = 'none';
+  setLive('全体を検出中', true);
+  setMiniMessage('全体モード');
+  toast('全体モード：画面内で最も目立つ人物を解析します。選手を拾う場合は「再選択」でレフェリーを指定してください。', true);
+}
+
+function selectAt(clientX, clientY){
+  if (!running || video.readyState < 2) return;
+  const pt = clientToVideo(clientX, clientY);
+  if (!pt) return;
+  track.tapMark = { x: pt.x, y: pt.y, t: performance.now() };
+
+  const sc = captureScan();
+  const sx = Math.min(sc.w - 1, Math.max(0, Math.round(pt.x / sc.scale)));
+  const sy = Math.min(sc.h - 1, Math.max(0, Math.round(pt.y / sc.scale)));
+  const res = selectReference(sc, sx, sy);
+
+  if (!res.ok){
+    flashHint(res.reason === 'common'
+      ? 'その色は画面内に広く存在します（芝生・観客席・他の人の服など）。シャツの別の位置をタップするか、レフェリーに近づけてください。'
+      : 'そこに色のまとまりが見つかりません。レフェリーのシャツの中央をタップしてください。');
+    return;
+  }
+
+  track.ref = res.ref;
+  track.tol = res.tol;
+  track.last = { cx: res.blob.cx, cy: res.blob.cy };
+  track.T = null; track.TArea = null; track.prevCenter = null; track.lostTicks = 0;
+  track.mode = 'tracking';
+  recentVotes = [];
+
+  tolSlider.value = String(res.tol);
+  tolVal.textContent = String(res.tol);
+  tolRow.style.display = 'flex';
+  hintBar.classList.remove('show');
+  setLive('レフェリー追跡中', true);
+  toast(res.ambiguous
+    ? 'レフェリーを登録しました。同じ色の人物が他にもいるため、直前の位置に近い人物を優先して追跡します。'
+    : 'レフェリーを登録しました。この色の人物だけを解析します。');
+}
+
+/* ---- per-tick processing ---- */
+async function processTick(){
+  if (busy) return;
+  busy = true;
+  try{
+    if (track.mode === 'tracking') await trackingTick();
+    else if (track.mode === 'all') await fullFrameTick();
+  } catch(err){
+    console.error(err);
+  } finally {
+    busy = false;
+  }
+}
+
+async function trackingTick(){
+  const sc = captureScan();
+  const { mask } = buildMask(sc, track.ref, track.tol);
+  const dil = dilate(mask, sc.w, sc.h);
+  const { blobs, label } = findBlobs(mask, dil, sc);
+  const blob = pickBlob(blobs, sc, track.last);
+
+  if (!blob){
+    track.lostTicks++;
+    track.overlay = null;
+    if (track.lostTicks >= 2){
+      setLive('レフェリー探索中…', false);
+      setMiniMessage('シャツの色が見つかりません');
+      recentVotes = [];
+    }
+    return;
+  }
+  track.lostTicks = 0;
+  track.last = { cx: blob.cx, cy: blob.cy };
+  setLive('レフェリー追跡中', true);
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const g = blobGeometry(blob, label, mask, sc);
+  const bbox = { x0: g.x0, y0: g.top, x1: g.x1, y1: g.bottom };
+
+  // Distance/zoom changed a lot since the last good skeleton -> forget the old torso length.
+  if (track.T && track.TArea){
+    const ratio = blob.area / track.TArea;
+    if (ratio < 0.45 || ratio > 2.2) track.T = null;
+  }
+  const T = track.T || estimateTorso(g, vh);
+
+  // The crop jumped (e.g. re-acquired after being lost): drop MediaPipe's internal tracking state.
+  const center = { x: g.cx, y: g.bottom };
+  if (track.prevCenter && dist(center, track.prevCenter) > 2 * T && typeof pose.reset === 'function'){
+    try{ pose.reset(); } catch(e){ /* not fatal */ }
+  }
+  track.prevCenter = center;
+
+  let accepted = null;
+  let rejectedOther = false;
+  let usedRoi = null;
+  for (const k of [1.0, 0.65]){          // second attempt: tighter crop, in case a neighbour was in the first one
+    const roi = makeRoi(g, T, k, vw, vh);
+    usedRoi = roi;
+    const res = await inferOn(cropToCanvas(roi, CROP_TARGET));
+    if (!running || track.mode !== 'tracking') return;   // stopped / re-selecting while we were busy
+    if (!res || !res.poseLandmarks) continue;
+
+    const px = toPixelLandmarks(res.poseLandmarks, roi);
+    if (!torsoMatches(px, sc, track.ref, track.tol).ok){ rejectedOther = true; continue; }
+    accepted = { px, roi };
+    break;
+  }
+
+  track.overlay = { t: performance.now(), bbox, roi: accepted ? accepted.roi : usedRoi, px: accepted ? accepted.px : null };
+
+  if (!accepted){
+    setMiniMessage(rejectedOther ? 'レフェリー以外を検出→スキップ' : '骨格を検出できません');
+    return;
+  }
+
+  // Remember torso length (smoothed) for the next tick's crop size.
+  const px = accepted.px;
+  const sm = { x: (px[11].x + px[12].x) / 2, y: (px[11].y + px[12].y) / 2 };
+  const hm = { x: (px[23].x + px[24].x) / 2, y: (px[23].y + px[24].y) / 2 };
+  const Tm = dist(sm, hm);
+  if (Tm > 8){
+    track.T = track.T ? track.T * 0.5 + Tm * 0.5 : Tm;
+    track.TArea = blob.area;
+  }
+  applyPose(px);
+}
+
+async function fullFrameTick(){
+  const roi = { x0: 0, y0: 0, w: video.videoWidth, h: video.videoHeight };
+  const res = await inferOn(cropToCanvas(roi, FULL_TARGET));
+  if (!running || track.mode !== 'all') return;
+  if (!res || !res.poseLandmarks){
+    setMiniMessage('人物を検出できません');
+    recentVotes = [];
+    track.overlay = null;
+    return;
+  }
+  const px = toPixelLandmarks(res.poseLandmarks, roi);
+  track.overlay = { t: performance.now(), px };
+  applyPose(px);
+}
+
+function applyPose(px){
+  const { scores } = classifier.classify(px);
+  const confidences = normalizeScores(scores);
+  const ranked = SIGNAL_DEFS
+    .map(d => ({ ...d, conf: confidences[d.id] ?? 0 }))
+    .sort((a,b) => b.conf - a.conf);
+  renderMiniPanel(ranked);
+  registerVote(ranked[0]);
+}
+
+/* ---- drawing: video every frame, overlay on top ---- */
+function drawOverlay(now){
+  const base = viewCanvas.width;
+
+  if (track.tapMark){
+    const age = now - track.tapMark.t;
+    if (age > 800){ track.tapMark = null; }
+    else {
+      viewCtx.strokeStyle = 'rgba(216,178,58,' + (1 - age / 800).toFixed(2) + ')';
+      viewCtx.lineWidth = Math.max(2, base * 0.004);
+      viewCtx.beginPath();
+      viewCtx.arc(track.tapMark.x, track.tapMark.y, base * (0.015 + 0.03 * age / 800), 0, Math.PI * 2);
+      viewCtx.stroke();
+    }
+  }
+
+  const o = track.overlay;
+  if (!o || now - o.t > 900) return;
+  const lw = Math.max(2, base * 0.003);
+
+  if (o.roi){
+    viewCtx.save();
+    viewCtx.setLineDash([lw * 3, lw * 2]);
+    viewCtx.strokeStyle = 'rgba(242,240,230,0.35)';
+    viewCtx.lineWidth = lw;
+    viewCtx.strokeRect(o.roi.x0, o.roi.y0, o.roi.w, o.roi.h);
+    viewCtx.restore();
+  }
+  if (o.bbox){
+    viewCtx.strokeStyle = '#D8B23A';
+    viewCtx.lineWidth = lw;
+    viewCtx.strokeRect(o.bbox.x0, o.bbox.y0, o.bbox.x1 - o.bbox.x0, o.bbox.y1 - o.bbox.y0);
+    const fs = Math.round(Math.max(13, base * 0.02));
+    viewCtx.font = '700 ' + fs + "px 'Zen Kaku Gothic New', sans-serif";
+    viewCtx.fillStyle = '#D8B23A';
+    viewCtx.fillText('レフェリー', o.bbox.x0, Math.max(fs, o.bbox.y0 - 6));
+  }
+  if (o.px) drawSkeletonPx(viewCtx, o.px, base);
+}
+
+function frameLoop(){
+  if (!running) return;
+  const now = performance.now();
+  if (video.readyState >= 2){
+    viewCtx.drawImage(video, 0, 0, viewCanvas.width, viewCanvas.height);
+    drawOverlay(now);
+    if (!busy && (track.mode === 'tracking' || track.mode === 'all') && (now - lastSendTime) >= processInterval){
+      lastSendTime = now;
+      processTick();
+    }
+  }
+  loopHandle = requestAnimationFrame(frameLoop);
+}
+
+/* ---- camera lifecycle ---- */
 async function startCamera(){
   try{
     stream = await navigator.mediaDevices.getUserMedia({
@@ -628,11 +1356,9 @@ async function startAll(){
     running = true;
     startScreen.style.display = 'none';
     controls.style.display = 'flex';
-    liveDot.classList.add('on');
-    liveText.textContent = '検出中';
-    recentVotes = [];
     lastAnnouncedId = null;
-    runLoop();
+    enterSelectMode();
+    frameLoop();
   } catch(err){
     console.error(err);
     if (!errorOverlay.classList.contains('show')){
@@ -643,51 +1369,16 @@ async function startAll(){
 
 function stopAll(){
   running = false;
+  cancelAnimationFrame(loopHandle);
   stopCamera();
-  liveDot.classList.remove('on');
-  liveText.textContent = '停止中';
+  track.mode = 'idle';
+  track.overlay = null;
+  hintBar.classList.remove('show');
+  tolRow.style.display = 'none';
+  setLive('停止中', false);
   controls.style.display = 'none';
   startScreen.style.display = 'flex';
-  viewCtx.clearRect(0,0,viewCanvas.width, viewCanvas.height);
-}
-
-async function runLoop(){
-  if (!running) return;
-  const now = performance.now();
-  if (video.readyState >= 2 && (now - lastSendTime) >= processInterval){
-    lastSendTime = now;
-    try{
-      await pose.send({ image: video });
-    } catch(err){
-      console.error(err);
-    }
-  }
-  loopHandle = requestAnimationFrame(runLoop);
-}
-
-function onPoseResults(results){
-  const w = viewCanvas.width, h = viewCanvas.height;
-  viewCtx.save();
-  viewCtx.drawImage(results.image, 0, 0, w, h);
-
-  if (!results.poseLandmarks){
-    confMini.innerHTML = '<div class="row">人物を検出できません</div>';
-    recentVotes = [];
-    viewCtx.restore();
-    return;
-  }
-
-  drawSkeleton(viewCtx, results.poseLandmarks, w, h);
-  viewCtx.restore();
-
-  const { scores } = classifier.classify(results.poseLandmarks);
-  const confidences = normalizeScores(scores);
-  const ranked = SIGNAL_DEFS
-    .map(d => ({ ...d, conf: confidences[d.id] ?? 0 }))
-    .sort((a,b) => b.conf - a.conf);
-
-  renderMiniPanel(ranked);
-  registerVote(ranked[0]);
+  viewCtx.clearRect(0, 0, viewCanvas.width, viewCanvas.height);
 }
 
 function renderMiniPanel(ranked){
@@ -745,9 +1436,20 @@ function addLogEntry(ja, conf){
 startBtn.addEventListener('click', startAll);
 stopBtn.addEventListener('click', stopAll);
 
+viewCanvas.addEventListener('click', (e) => {
+  if (track.mode === 'select') selectAt(e.clientX, e.clientY);
+});
+skipSelectBtn.addEventListener('click', enterAllMode);
+reselectBtn.addEventListener('click', () => { if (running) enterSelectMode(); });
+tolSlider.addEventListener('input', () => {
+  track.tol = Number(tolSlider.value);
+  tolVal.textContent = tolSlider.value;
+});
+
 flipBtn.addEventListener('click', async () => {
   facingMode = (facingMode === 'environment') ? 'user' : 'environment';
   stopCamera();
+  track.last = null; track.T = null; track.TArea = null; track.prevCenter = null; track.overlay = null;
   try{
     await startCamera();
   } catch(err){ /* already surfaced via showError */ }
