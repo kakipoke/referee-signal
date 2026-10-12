@@ -46,21 +46,30 @@
     background:#000;
     overflow:hidden;
   }
+  /* The picture is the <video> element itself, so the browser composites it off the main thread
+     and it stays smooth even while pose estimation is busy. The canvas above it is a transparent
+     overlay (skeleton, boxes). Both use object-fit:contain with the same intrinsic aspect ratio,
+     so they line up exactly and tap positions map 1:1 onto video pixels. */
+  video#video{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    object-fit:contain;
+    display:block;
+    background:#000;
+    z-index:0;
+  }
   #view{
     position:absolute;
     inset:0;
     width:100%;
     height:100%;
-    object-fit:contain;      /* contain (not cover) so tap positions map 1:1 onto the video and nothing is cropped away */
+    object-fit:contain;
     display:block;
+    background:transparent;
+    z-index:1;
     touch-action:manipulation;
-  }
-  video#video{
-    position:fixed;
-    width:1px;height:1px;
-    opacity:0;
-    pointer-events:none;
-    top:0;left:0;
   }
 
   /* ---- start screen ---- */
@@ -139,6 +148,20 @@
     background:var(--muted);
   }
   #liveDot.on{ background:#5FE07C; box-shadow:0 0 6px #5FE07C; }
+  #whistleInd{ display:none; font-size:0.8rem; opacity:0.35; filter:grayscale(1); transition:opacity .1s; }
+  #whistleInd.show{ display:inline; }
+  #whistleInd.on{ opacity:1; filter:none; }
+  .ctrl-btn.toggle-on{ border-color:var(--accent); color:var(--accent); }
+  .seg{ display:inline-flex; border:1px solid var(--line); background:rgba(0,0,0,0.35); }
+  .seg button{
+    font-family:inherit; font-size:0.78rem; color:var(--muted); background:transparent;
+    border:0; padding:9px 12px; cursor:pointer;
+  }
+  .seg button + button{ border-left:1px solid var(--line); }
+  .seg button.sel{ background:var(--accent); color:#10240f; font-weight:700; }
+  .seg-label{ font-size:0.72rem; color:var(--muted); }
+  .mode-pick{ display:flex; flex-direction:column; align-items:center; gap:6px; }
+  .ctrl-btn:disabled{ opacity:0.45; cursor:default; }
   #confMini{
     background:rgba(0,0,0,0.4);
     border:1px solid var(--line);
@@ -368,7 +391,7 @@
     <video id="video" playsinline muted></video>
 
     <div id="topBar">
-      <div id="liveBadge"><span id="liveDot"></span><span id="liveText">停止中</span></div>
+      <div id="liveBadge"><span id="liveDot"></span><span id="liveText">停止中</span><span id="whistleInd" title="笛の検知">🔔</span></div>
       <div id="confMini"></div>
     </div>
 
@@ -386,9 +409,16 @@
 
     <div id="startScreen">
       <h1 class="display">レフェリーシグナル判定<br>（カメラ版）</h1>
-      <p>カメラを向けて、画面上のレフェリーをタップ。シャツの色を覚えて、レフェリーだけを追跡して反則シグナルを検出します。</p>
+      <p>カメラを向けて、画面上のレフェリーをタップ。シャツの色を覚えて、レフェリーだけを追跡します。笛が鳴ったときだけシグナルを判定します（マイクを使用）。</p>
+      <div class="mode-pick">
+        <span class="seg-label">判定のタイミング</span>
+        <div class="seg" id="startSeg">
+          <button type="button" data-mode="whistle">🔔 笛が鳴ったときだけ</button>
+          <button type="button" data-mode="always">常に判定</button>
+        </div>
+      </div>
       <button id="startBtn">カメラを開始</button>
-      <div class="privacy-note">🔒 映像は一切外部送信されません。骨格推定・判定はすべて端末内（ブラウザ内）で処理されます。</div>
+      <div class="privacy-note">🔒 映像・音声は録音も外部送信もされません。骨格推定・笛の検知・判定はすべて端末内（ブラウザ内）で処理されます。</div>
     </div>
 
     <div id="controls" style="display:none;">
@@ -397,6 +427,11 @@
         <input type="range" id="tolSlider" min="10" max="45" step="1" value="26">
         <span class="tol-val" id="tolVal">26</span>
       </div>
+      <div class="seg" id="ctrlSeg">
+        <button type="button" data-mode="whistle">🔔 笛で判定</button>
+        <button type="button" data-mode="always">常に判定</button>
+      </div>
+      <button class="ctrl-btn" id="manualBtn">✋ 今すぐ判定</button>
       <button class="ctrl-btn" id="reselectBtn">🎯 再選択</button>
       <button class="ctrl-btn" id="flipBtn">🔄 前後切替</button>
       <button class="ctrl-btn stop" id="stopBtn">■ 停止</button>
@@ -618,6 +653,25 @@ function rgbToLab(r, g, b, out, o){
   out[o+2] = 200*(fy - fz);
 }
 
+// Lab for every 5-bit-per-channel RGB colour, built once. Converting a frame then costs one table
+// lookup per pixel instead of three cube roots (~170k cbrt calls per 320x180 frame otherwise).
+// Quantisation error is a few Lab units at most -- well under the 12..28 tolerances used.
+const LAB_LUT = (() => {
+  const t = new Float32Array(32768 * 3);
+  for (let i = 0; i < 32768; i++){
+    rgbToLab(((i >> 10) & 31) * 8 + 4, ((i >> 5) & 31) * 8 + 4, (i & 31) * 8 + 4, t, 3 * i);
+  }
+  return t;
+})();
+
+function fillLabFromRGBA(data, n, out){
+  for (let i = 0; i < n; i++){
+    const o = 3 * (((data[4*i] >> 3) << 10) | ((data[4*i+1] >> 3) << 5) | (data[4*i+2] >> 3));
+    const p = 3 * i;
+    out[p] = LAB_LUT[o]; out[p+1] = LAB_LUT[o+1]; out[p+2] = LAB_LUT[o+2];
+  }
+}
+
 // Lightness counts half as much as hue/chroma, so sun/shade changes on the same
 // shirt don't break the match, while a different hue still does.
 const L_WEIGHT = 0.5;
@@ -821,20 +875,33 @@ function estimateTorso(g, vh){
   return Math.min(Math.max(g.bh * 0.9, vh * 0.05), vh * 0.4);
 }
 
-// Body-sized crop: from 3T above the hip line (room for raised arms) to 2.1T below
-// (legs), 2.3T to each side (room for arms held out). k < 1 gives a tighter retry crop.
+// Place a square of side `size` so it stays inside [0, max] when it fits (sliding it if the person
+// is near an edge); if it is larger than the frame, centre it (the overhang is padded black).
+function fitAxis(x0, size, max){
+  if (size >= max) return (max - size) / 2;
+  return Math.min(Math.max(x0, 0), max - size);
+}
+
+// Body-sized SQUARE crop around the hip line: 3T above (room for raised arms) to 2.1T below
+// (legs), so ~5.1T tall; square so it can be handed to the pose model at one FIXED size
+// (a crop whose size changes every tick makes MediaPipe reallocate its buffers each time).
+// k < 1 gives a tighter retry crop.
 function makeRoi(g, T, k, vw, vh){
   const cy = g.bottom - 0.45 * T;
-  const halfH = 2.55 * T * k, halfW = 2.3 * T * k;
-  const x0 = Math.max(0, g.cx - halfW), x1 = Math.min(vw, g.cx + halfW);
-  const y0 = Math.max(0, cy - halfH),   y1 = Math.min(vh, cy + halfH);
-  return { x0, y0, w: Math.max(32, x1 - x0), h: Math.max(32, y1 - y0) };
+  const size = Math.max(48, 5.1 * T * k);
+  return { x0: fitAxis(g.cx - size / 2, size, vw), y0: fitAxis(cy - size / 2, size, vh), size };
+}
+
+// Square covering the whole frame (no referee selected). Shorter axis is padded.
+function makeFullRoi(vw, vh){
+  const size = Math.max(vw, vh);
+  return { x0: (vw - size) / 2, y0: (vh - size) / 2, size };
 }
 
 // MediaPipe returns landmarks normalised to the CROP. Convert to full-frame PIXELS:
 // pixels (not 0..1) are required so angles aren't distorted by the frame's aspect ratio.
 function toPixelLandmarks(lms, roi){
-  return lms.map(l => ({ x: roi.x0 + l.x * roi.w, y: roi.y0 + l.y * roi.h, visibility: l.visibility }));
+  return lms.map(l => ({ x: roi.x0 + l.x * roi.size, y: roi.y0 + l.y * roi.size, visibility: l.visibility }));
 }
 
 // Is the skeleton's torso (shoulder-shoulder-hip-hip quad) actually wearing the referee's colour?
@@ -893,6 +960,76 @@ function drawSkeletonPx(ctx, lm, base){
   });
 }
 
+/* ===== WHISTLE-PURE START ===== */
+/* =========================================================================
+   WHISTLE DETECTION (pure: takes an FFT magnitude spectrum in dB, no browser APIs)
+   A referee's whistle is a loud, narrow, steady tone around 2-4.5 kHz. Speech, crowd noise and
+   music spread their energy over many frequencies, so "one tall narrow peak that holds most of
+   the band's energy for >= ~120 ms" separates a whistle from them.
+   ========================================================================= */
+const WH = {
+  LOW_HZ: 1800, HIGH_HZ: 4800,   // band searched for the whistle's fundamental
+  MIN_PEAK_DB: -80,              // ignore peaks quieter than this (AnalyserNode dB scale; mic floor is ~ -95)
+  PROMINENCE_DB: 22,             // peak must stand this far above the band's median level
+  CONCENTRATION: 0.6,            // share of the band's power within +-NEAR_HZ of the peak
+  NEAR_HZ: 120,
+  MIN_ON_MS: 120,                // tone must last this long to count (rejects clicks / chirps)
+  GAP_MS: 120,                   // a dropout shorter than this does not restart the timing (pea trills flicker)
+  OFF_MS: 250,                   // silence this long = the blast has ended
+  MAX_JUMP_HZ: 300               // peak frequency may wander this much between frames
+};
+const WH_NONE = { isTone: false, peakHz: 0, peakDb: -Infinity, prominence: 0, concentration: 0 };
+
+function analyseWhistleFrame(db, sampleRate, fftSize){
+  const binHz = sampleRate / fftSize;
+  const lo = Math.max(1, Math.ceil(WH.LOW_HZ / binHz));
+  const hi = Math.min(db.length - 1, Math.floor(WH.HIGH_HZ / binHz));
+  if (hi - lo < 12) return WH_NONE;
+  let pk = lo;
+  for (let i = lo + 1; i <= hi; i++) if (db[i] > db[pk]) pk = i;
+  const peakDb = db[pk];
+  if (!(peakDb > WH.MIN_PEAK_DB)) return { ...WH_NONE, peakHz: pk * binHz, peakDb };
+
+  const band = [];
+  let tot = 0, near = 0;
+  const nearBins = Math.max(2, Math.round(WH.NEAR_HZ / binHz));
+  for (let i = lo; i <= hi; i++){
+    band.push(db[i]);
+    const p = Math.pow(10, db[i] / 10);
+    tot += p;
+    if (Math.abs(i - pk) <= nearBins) near += p;
+  }
+  band.sort((a, b) => a - b);
+  const median = band[band.length >> 1];
+  const prominence = peakDb - median;
+  const concentration = tot > 0 ? near / tot : 0;
+  return {
+    isTone: prominence >= WH.PROMINENCE_DB && concentration >= WH.CONCENTRATION,
+    peakHz: pk * binHz, peakDb, prominence, concentration
+  };
+}
+
+// Turns per-frame "is there a tone at X Hz" into start / end events.
+class WhistleDetector{
+  constructor(){ this.active = false; this.toneSince = null; this.lastToneAt = 0; this.lastHz = 0; }
+  feed(hz, now){
+    if (hz > 0){
+      if (this.toneSince === null || Math.abs(hz - this.lastHz) > WH.MAX_JUMP_HZ) this.toneSince = now;
+      this.lastHz = hz;
+      this.lastToneAt = now;
+      if (!this.active && now - this.toneSince >= WH.MIN_ON_MS){ this.active = true; return 'start'; }
+    } else {
+      if (!this.active && this.toneSince !== null && now - this.lastToneAt > WH.GAP_MS) this.toneSince = null;
+      if (this.active && now - this.lastToneAt >= WH.OFF_MS){
+        this.active = false; this.toneSince = null;
+        return 'end';
+      }
+    }
+    return null;
+  }
+}
+/* ===== WHISTLE-PURE END ===== */
+
 /* =========================================================================
    CAMERA + REALTIME LOOP
    ========================================================================= */
@@ -926,10 +1063,11 @@ const toastEl       = document.getElementById('toast');
 const tolRow        = document.getElementById('tolRow');
 const tolSlider     = document.getElementById('tolSlider');
 const tolVal        = document.getElementById('tolVal');
+const whistleInd    = document.getElementById('whistleInd');
+const segs          = [document.getElementById('startSeg'), document.getElementById('ctrlSeg')];
+const manualBtn     = document.getElementById('manualBtn');
 
 const SCAN_W = 320;        // width of the downscaled copy used for colour search
-const CROP_TARGET = 384;   // long side (px) of the crop handed to pose estimation
-const FULL_TARGET = 640;   // long side when running on the whole frame (no referee selected)
 const HINT_DEFAULT = 'レフェリーのシャツをタップして選択してください';
 
 let pose = null;
@@ -1028,32 +1166,48 @@ function onPoseResults(results){
 
 async function inferOn(source){
   const waiting = new Promise(resolve => { resultResolver = resolve; });
+  let timer = null;
   try{
     await pose.send({ image: source });
-    return await Promise.race([waiting, new Promise(r => setTimeout(() => r(null), 1500))]);
+    return await Promise.race([waiting, new Promise(r => { timer = setTimeout(() => r(null), 1500); })]);
   } finally {
+    clearTimeout(timer);
     resultResolver = null;
   }
 }
 
-const cropCanvas = document.createElement('canvas');
-const cropCtx = cropCanvas.getContext('2d');
-function cropToCanvas(roi, target){
-  const longSide = Math.max(roi.w, roi.h);
-  const scale = Math.min(Math.max(target / longSide, 0.25), 2.5);
-  const cw = Math.max(64, Math.round(roi.w * scale));
-  const ch = Math.max(64, Math.round(roi.h * scale));
-  cropCanvas.width = cw;           // (re)setting the size also clears the canvas
-  cropCanvas.height = ch;
-  cropCtx.imageSmoothingEnabled = true;
-  cropCtx.imageSmoothingQuality = 'high';
-  cropCtx.drawImage(video, roi.x0, roi.y0, roi.w, roi.h, 0, 0, cw, ch);
-  return cropCanvas;
+// Fixed-size SQUARE input canvases. The size never changes between ticks, so the pose model's
+// input buffers are reused instead of reallocated, and the per-tick canvas resize/clear is gone.
+const CROP_SIZE = 320;   // tracking crops
+const FULL_SIZE = 480;   // whole-frame mode
+const cropCanvases = {};
+function cropToCanvas(roi, size){
+  let c = cropCanvases[size];
+  if (!c){
+    c = cropCanvases[size] = document.createElement('canvas');
+    c.width = size; c.height = size;
+    c.ctx = c.getContext('2d');
+    c.ctx.imageSmoothingEnabled = true;
+    c.ctx.imageSmoothingQuality = 'low';   // 'high' costs real time on phones; the crop is a downscale
+  }
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const k = size / roi.size;
+  // clip the source square to the frame; whatever sticks out is left black
+  const sx0 = Math.max(0, roi.x0), sy0 = Math.max(0, roi.y0);
+  const sx1 = Math.min(vw, roi.x0 + roi.size), sy1 = Math.min(vh, roi.y0 + roi.size);
+  c.ctx.fillStyle = '#000';
+  c.ctx.fillRect(0, 0, size, size);
+  if (sx1 > sx0 && sy1 > sy0){
+    c.ctx.drawImage(video, sx0, sy0, sx1 - sx0, sy1 - sy0,
+                    (sx0 - roi.x0) * k, (sy0 - roi.y0) * k, (sx1 - sx0) * k, (sy1 - sy0) * k);
+  }
+  return c;
 }
 
 /* ---- small downscaled frame with per-pixel Lab, used for colour search ---- */
 const scanCanvas = document.createElement('canvas');
 const scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
+let scanLab = null;
 function captureScan(){
   const vw = video.videoWidth, vh = video.videoHeight;
   const w = SCAN_W, h = Math.max(1, Math.round(SCAN_W * vh / vw));
@@ -1063,11 +1217,9 @@ function captureScan(){
   }
   scanCtx.drawImage(video, 0, 0, w, h);
   const data = scanCtx.getImageData(0, 0, w, h).data;
-  const lab = new Float32Array(w * h * 3);
-  for (let i = 0, n = w * h; i < n; i++){
-    rgbToLab(data[4*i], data[4*i+1], data[4*i+2], lab, 3*i);
-  }
-  return { w, h, lab, scale: vw / w };
+  if (!scanLab || scanLab.length !== w * h * 3) scanLab = new Float32Array(w * h * 3);   // reused every tick
+  fillLabFromRGBA(data, w * h, scanLab);
+  return { w, h, lab: scanLab, scale: vw / w };
 }
 
 // Screen tap -> video pixel (the canvas is letterboxed with object-fit: contain).
@@ -1085,6 +1237,7 @@ function clientToVideo(clientX, clientY){
 
 /* ---- modes ---- */
 function enterSelectMode(){
+  judge.active = false;
   track.mode = 'select';
   track.ref = null; track.last = null; track.T = null; track.TArea = null;
   track.prevCenter = null; track.overlay = null; track.lostTicks = 0;
@@ -1106,6 +1259,7 @@ function enterAllMode(){
   setLive('全体を検出中', true);
   setMiniMessage('全体モード');
   toast('全体モード：画面内で最も目立つ人物を解析します。選手を拾う場合は「再選択」でレフェリーを指定してください。', true);
+  showWaiting();
 }
 
 function selectAt(clientX, clientY){
@@ -1141,12 +1295,213 @@ function selectAt(clientX, clientY){
   toast(res.ambiguous
     ? 'レフェリーを登録しました。同じ色の人物が他にもいるため、直前の位置に近い人物を優先して追跡します。'
     : 'レフェリーを登録しました。この色の人物だけを解析します。');
+  showWaiting();
+}
+
+/* ---- whistle-triggered judging ----
+   Pose estimation (the heavy part) only runs while a "judge window" is open. A window opens when
+   a whistle is heard (or the user taps 今すぐ判定), and closes when a signal is announced or
+   no signal was recognised within a few seconds after the whistle ended. In between, only a cheap
+   colour scan runs so the referee stays located. */
+const JUDGE_AFTER_WHISTLE_MS = 4500;   // keep judging this long after the whistle stops
+const JUDGE_MAX_MS = 10000;            // hard cap per window
+const IDLE_SCAN_MS = 400;
+const judge = { preferWhistle: true, whistleMode: true, micOk: false, active: false, openedAt: 0, lastEnd: 0, whistling: false, announced: false, source: '' };
+let lastIdleTime = 0;
+
+function judgingNow(now){
+  if (!judge.whistleMode) return true;
+  if (!judge.active) return false;
+  if ((!judge.whistling && now - judge.lastEnd > JUDGE_AFTER_WHISTLE_MS) || now - judge.openedAt > JUDGE_MAX_MS){
+    closeJudgeWindow(judge.announced ? 'done' : 'timeout');
+    return false;
+  }
+  return true;
+}
+
+function showWaiting(){
+  if (!judge.whistleMode || !running) return;
+  if (track.mode === 'tracking' || track.mode === 'all'){
+    setLive('笛待機中', true);
+    setMiniMessage('笛の音を待っています');
+  }
+}
+
+function openJudgeWindow(source){
+  if (!running || !(track.mode === 'tracking' || track.mode === 'all')) return;
+  const now = performance.now();
+  if (!judge.active){
+    judge.active = true; judge.openedAt = now; judge.announced = false;
+    recentVotes = [];
+    lastSendTime = 0;                  // first inference on the very next frame
+    track.overlay = null;
+  }
+  judge.source = source;
+  judge.lastEnd = now;                 // manual windows count from now; whistle windows update on 'end'
+  setLive(source === 'whistle' ? '笛を検知・判定中…' : '判定中…', true);
+  setMiniMessage('シグナルを解析中…');
+}
+
+function closeJudgeWindow(reason){
+  if (!judge.active) return;
+  judge.active = false;
+  recentVotes = [];
+  if (reason === 'timeout') toast('シグナルを判別できませんでした。笛のあと、シグナルをはっきり示してください。', true);
+  showWaiting();
+}
+
+function onWhistleStart(){
+  judge.whistling = true;
+  if (judge.whistleMode) openJudgeWindow('whistle');
+}
+function onWhistleEnd(){
+  judge.whistling = false;
+  judge.lastEnd = performance.now();
+}
+
+/* ---- microphone: local analysis only, audio is never recorded or sent anywhere ---- */
+let audioCtx = null, analyser = null, micStream = null, audioTimer = null, freqBuf = null;
+const whistleDet = new WhistleDetector();
+
+function prepareAudioContext(){
+  // created inside the tap handler so the browser allows it to start
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC && !audioCtx){ audioCtx = new AC(); if (audioCtx.resume) audioCtx.resume(); }
+  } catch(e){ audioCtx = null; }
+}
+
+async function startMic(){
+  judge.whistleMode = true;
+  try{
+    if (!audioCtx) throw new Error('AudioContext unavailable');
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },   // filters would distort / suppress the whistle
+      video: false
+    });
+    if (audioCtx.resume) await audioCtx.resume();
+    const src = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0;     // react immediately
+    analyser.minDecibels = -120; analyser.maxDecibels = 0;
+    src.connect(analyser);                  // NOT connected to the speakers: no echo, nothing is played
+    freqBuf = new Float32Array(analyser.frequencyBinCount);
+    audioTimer = setInterval(audioTick, 40);
+    judge.micOk = true;
+  } catch(err){
+    console.error(err);
+    judge.micOk = false;
+    judge.whistleMode = false;
+    toast('マイクを使えないため、笛の検知はできません。常時判定モードで動作します。', true);
+  }
+  updateWhistleUi();
+}
+
+function stopMic(){
+  clearInterval(audioTimer); audioTimer = null;
+  if (micStream){ micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  analyser = null; judge.micOk = false;
+  whistleDet.active = false; whistleDet.toneSince = null;
+  judge.active = false; judge.whistling = false;
+}
+
+function audioTick(){
+  if (!analyser || !audioCtx) return;
+  analyser.getFloatFrequencyData(freqBuf);
+  const info = analyseWhistleFrame(freqBuf, audioCtx.sampleRate, analyser.fftSize);
+  const ev = whistleDet.feed(info.isTone ? info.peakHz : 0, performance.now());
+  whistleInd.classList.toggle('on', whistleDet.active);
+  if (ev === 'start') onWhistleStart();
+  else if (ev === 'end') onWhistleEnd();
+}
+
+/* The chosen mode is remembered on this phone (localStorage may be unavailable -> default). */
+function loadModePref(){
+  try{ return localStorage.getItem('refSigMode') !== 'always'; } catch(e){ return true; }
+}
+function saveModePref(){
+  try{ localStorage.setItem('refSigMode', judge.preferWhistle ? 'whistle' : 'always'); } catch(e){ /* not fatal */ }
+}
+judge.preferWhistle = loadModePref();
+
+function updateWhistleUi(){
+  const effective = running ? judge.whistleMode : judge.preferWhistle;   // what is really in force
+  segs.forEach(seg => seg.querySelectorAll('button').forEach(b => b.classList.toggle('sel', (b.dataset.mode === 'whistle') === effective)));
+  whistleInd.classList.toggle('show', judge.micOk && judge.whistleMode);
+  manualBtn.style.display = judge.whistleMode ? '' : 'none';
+}
+
+// Called by the 笛で判定 / 常に判定 switch (start screen or while running).
+async function chooseMode(mode){
+  judge.preferWhistle = (mode === 'whistle');
+  saveModePref();
+  if (!running){ updateWhistleUi(); return; }
+  if (judge.preferWhistle && !judge.micOk){
+    prepareAudioContext();
+    await startMic();                 // asks for the microphone now; falls back to 常に判定 if refused
+    if (!judge.micOk){ updateWhistleUi(); return; }
+  }
+  setWhistleMode(judge.preferWhistle);
+}
+
+function setWhistleMode(on){
+  judge.whistleMode = !!on && judge.micOk;
+  judge.active = false;
+  recentVotes = [];
+  updateWhistleUi();
+  if (judge.whistleMode){
+    showWaiting();
+    toast('笛が鳴ったときだけ判定します。', false);
+  } else if (running && (track.mode === 'tracking' || track.mode === 'all')){
+    setLive(track.mode === 'tracking' ? 'レフェリー追跡中' : '全体を検出中', true);
+    toast('常時判定モードに切り替えました。', false);
+  }
+}
+
+/* Between windows: colour scan only (no pose model) so the referee box stays on screen. */
+function idleTick(){
+  if (track.mode !== 'tracking') return;
+  const sc = captureScan();
+  const { mask } = buildMask(sc, track.ref, track.tol);
+  const dil = dilate(mask, sc.w, sc.h);
+  const { blobs, label } = findBlobs(mask, dil, sc);
+  const blob = pickBlob(blobs, sc, track.last);
+  if (!blob){
+    track.overlay = null;
+    if (++track.lostTicks >= 2) setLive('レフェリー探索中…', false);
+    return;
+  }
+  track.lostTicks = 0;
+  track.last = { cx: blob.cx, cy: blob.cy };
+  const g = blobGeometry(blob, label, mask, sc);
+  track.overlay = { t: performance.now(), bbox: { x0: g.x0, y0: g.top, x1: g.x1, y1: g.bottom }, roi: null, px: null };
+  if (judge.whistleMode && !judge.active) setLive('笛待機中', true);
 }
 
 /* ---- per-tick processing ---- */
+// Adaptive load: measure how long a tick really takes on THIS phone and space the ticks out
+// accordingly (so the main thread gets idle time), and drop to the lighter model if it's slow.
+const INTERVAL_MIN = 200, INTERVAL_MAX = 900;
+const SLOW_TICK_MS = 450, SLOW_TICKS_FOR_LITE = 4;
+let avgTickMs = 0, slowTicks = 0, skipStats = 1, liteMode = false;   // skipStats: ignore model warm-up
+
+function recordTickTime(ms){
+  if (skipStats > 0){ skipStats--; return; }
+  avgTickMs = avgTickMs ? avgTickMs * 0.7 + ms * 0.3 : ms;
+  processInterval = Math.min(INTERVAL_MAX, Math.max(INTERVAL_MIN, Math.round(avgTickMs * 1.7)));
+  slowTicks = ms > SLOW_TICK_MS ? slowTicks + 1 : 0;
+  if (!liteMode && slowTicks >= SLOW_TICKS_FOR_LITE && pose){
+    liteMode = true; slowTicks = 0; skipStats = 1; avgTickMs = 0;
+    try{ pose.setOptions({ modelComplexity: 0 }); } catch(e){ /* not fatal */ }
+    toast('処理が重いため軽量モードに切り替えました（精度は少し下がります）', true);
+  }
+}
+
 async function processTick(){
   if (busy) return;
   busy = true;
+  const t0 = performance.now();
   try{
     if (track.mode === 'tracking') await trackingTick();
     else if (track.mode === 'all') await fullFrameTick();
@@ -1154,6 +1509,7 @@ async function processTick(){
     console.error(err);
   } finally {
     busy = false;
+    recordTickTime(performance.now() - t0);
   }
 }
 
@@ -1202,7 +1558,7 @@ async function trackingTick(){
   for (const k of [1.0, 0.65]){          // second attempt: tighter crop, in case a neighbour was in the first one
     const roi = makeRoi(g, T, k, vw, vh);
     usedRoi = roi;
-    const res = await inferOn(cropToCanvas(roi, CROP_TARGET));
+    const res = await inferOn(cropToCanvas(roi, CROP_SIZE));
     if (!running || track.mode !== 'tracking') return;   // stopped / re-selecting while we were busy
     if (!res || !res.poseLandmarks) continue;
 
@@ -1232,8 +1588,8 @@ async function trackingTick(){
 }
 
 async function fullFrameTick(){
-  const roi = { x0: 0, y0: 0, w: video.videoWidth, h: video.videoHeight };
-  const res = await inferOn(cropToCanvas(roi, FULL_TARGET));
+  const roi = makeFullRoi(video.videoWidth, video.videoHeight);
+  const res = await inferOn(cropToCanvas(roi, FULL_SIZE));
   if (!running || track.mode !== 'all') return;
   if (!res || !res.poseLandmarks){
     setMiniMessage('人物を検出できません');
@@ -1281,7 +1637,7 @@ function drawOverlay(now){
     viewCtx.setLineDash([lw * 3, lw * 2]);
     viewCtx.strokeStyle = 'rgba(242,240,230,0.35)';
     viewCtx.lineWidth = lw;
-    viewCtx.strokeRect(o.roi.x0, o.roi.y0, o.roi.w, o.roi.h);
+    viewCtx.strokeRect(o.roi.x0, o.roi.y0, o.roi.size, o.roi.size);
     viewCtx.restore();
   }
   if (o.bbox){
@@ -1296,15 +1652,46 @@ function drawOverlay(now){
   if (o.px) drawSkeletonPx(viewCtx, o.px, base);
 }
 
+// The picture itself is the native <video> element (the browser composites it off the main
+// thread, so it stays smooth while inference runs). Only the transparent overlay canvas is
+// redrawn, and only when something about it changed.
+let overlayDrawnKey = null;
+function overlayKey(now){
+  const o = track.overlay;
+  const live = o && now - o.t <= 900;
+  return (track.tapMark ? 'tap' + Math.floor(now / 33) : '') + '|' + (live ? o.t : 'x');
+}
+function redrawOverlayIfNeeded(now){
+  const key = overlayKey(now);
+  if (key === overlayDrawnKey) return;
+  overlayDrawnKey = key;
+  viewCtx.clearRect(0, 0, viewCanvas.width, viewCanvas.height);
+  drawOverlay(now);
+}
+
+function syncOverlaySize(){
+  if (video.videoWidth && (viewCanvas.width !== video.videoWidth || viewCanvas.height !== video.videoHeight)){
+    viewCanvas.width = video.videoWidth;     // also clears it
+    viewCanvas.height = video.videoHeight;
+    overlayDrawnKey = null;
+  }
+}
+
 function frameLoop(){
   if (!running) return;
   const now = performance.now();
   if (video.readyState >= 2){
-    viewCtx.drawImage(video, 0, 0, viewCanvas.width, viewCanvas.height);
-    drawOverlay(now);
-    if (!busy && (track.mode === 'tracking' || track.mode === 'all') && (now - lastSendTime) >= processInterval){
-      lastSendTime = now;
-      processTick();
+    redrawOverlayIfNeeded(now);
+    if (!busy && (track.mode === 'tracking' || track.mode === 'all')){
+      if (judgingNow(now)){
+        if ((now - lastSendTime) >= processInterval){
+          lastSendTime = now;
+          processTick();
+        }
+      } else if (track.mode === 'tracking' && (now - lastIdleTime) >= IDLE_SCAN_MS){
+        lastIdleTime = now;
+        idleTick();
+      }
     }
   }
   loopHandle = requestAnimationFrame(frameLoop);
@@ -1338,8 +1725,8 @@ async function startCamera(){
     video.onloadedmetadata = () => resolve();
   });
 
-  viewCanvas.width = video.videoWidth;
-  viewCanvas.height = video.videoHeight;
+  syncOverlaySize();
+  video.addEventListener('resize', syncOverlaySize);   // e.g. camera flip / orientation change
 }
 
 function stopCamera(){
@@ -1352,8 +1739,14 @@ function stopCamera(){
 async function startAll(){
   try{
     if (!pose) initPose();
+    prepareAudioContext();
+    if (pose && typeof pose.initialize === 'function'){ pose.initialize().catch(() => {}); }   // load the model now, not at the first whistle
     await startCamera();
+    if (judge.preferWhistle) await startMic();
+    else { judge.whistleMode = false; judge.micOk = false; }
+    updateWhistleUi();
     running = true;
+    updateWhistleUi();
     startScreen.style.display = 'none';
     controls.style.display = 'flex';
     lastAnnouncedId = null;
@@ -1369,6 +1762,8 @@ async function startAll(){
 
 function stopAll(){
   running = false;
+  stopMic();
+  updateWhistleUi();
   cancelAnimationFrame(loopHandle);
   stopCamera();
   track.mode = 'idle';
@@ -1420,6 +1815,7 @@ function announce(ja, conf){
   bannerHideTimer = setTimeout(() => foulBanner.classList.remove('show'), 3200);
 
   addLogEntry(ja, conf);
+  if (judge.whistleMode && judge.active){ judge.announced = true; closeJudgeWindow('done'); }
 }
 
 function addLogEntry(ja, conf){
@@ -1434,6 +1830,9 @@ function addLogEntry(ja, conf){
 
 /* ---- controls ---- */
 startBtn.addEventListener('click', startAll);
+segs.forEach(seg => seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => chooseMode(b.dataset.mode))));
+updateWhistleUi();
+manualBtn.addEventListener('click', () => openJudgeWindow('manual'));
 stopBtn.addEventListener('click', stopAll);
 
 viewCanvas.addEventListener('click', (e) => {
